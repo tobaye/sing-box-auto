@@ -24,6 +24,8 @@
 #   - 全程无交互：UUID、密码、Reality 密钥对全部自动生成
 #   - 默认端口：VLESS 29821 / VMess-WS 20867 / Hy2 37724 / TUIC 60571 / AnyTLS 24878，
 #     端口被占用时自动递增
+#   - 防火墙：自动从配置提取监听端口并在 firewalld/ufw/iptables 放行，
+#     配置增减协议或换端口时自动跟上
 #   - 证书：自动生成 www.bing.com 自签证书（供 Hy2/TUIC/AnyTLS/VMess-WS 使用）
 #   - 幂等：重复运行保留已有 UUID/端口/密钥，只重写配置并重启；也能识别原版
 #     yonggekkk 脚本留下的配置并导入
@@ -124,18 +126,48 @@ alloc_port() {
 }
 
 #----------------------------- 3. 防火墙放行 ---------------------------------
-# 对应原版 openyn→close：默认选"是"，直接放行（原版回车默认值也是执行）
+# 自适应放行：从已生成的 sing-box 配置里提取所有 inbound 监听端口，
+# TCP+UDP 双开。以后脚本增减协议、换端口，这里自动跟上，无需维护端口列表。
+# 必须在 write_config 之后调用。云厂商安全组/安全列表需在控制台另行放行。
 open_firewall() {
-  echo "[信息] 放行防火墙…"
-  systemctl stop firewalld >/dev/null 2>&1 || true
-  systemctl disable firewalld >/dev/null 2>&1 || true
-  ufw disable >/dev/null 2>&1 || true
+  local ports=""
+  if [[ -f "$SB_DIR/sb.json" ]] && command -v jq >/dev/null 2>&1; then
+    ports=$(jq -r '.inbounds[].listen_port // empty' "$SB_DIR/sb.json" 2>/dev/null | sort -un | tr '\n' ' ' || true)
+  fi
+  # 回退：配置文件不存在或 jq 不可用时，用 PORT_* 变量
+  if [[ -z "${ports// }" ]]; then
+    ports="${PORT_VLESS:-} ${PORT_VMESS:-} ${PORT_HY2:-} ${PORT_TUIC:-} ${PORT_ANYTLS:-}"
+  fi
+  if [[ -z "${ports// }" ]]; then
+    echo "[警告] 未找到需要放行的端口，跳过防火墙设置"
+    return 0
+  fi
+  echo "[信息] 放行防火墙端口：${ports}（TCP+UDP）…"
+  local p
+  # firewalld：仅当正在运行时加规则，不擅自启停它
+  if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
+    for p in $ports; do
+      firewall-cmd --permanent --add-port="${p}/tcp" >/dev/null 2>&1
+      firewall-cmd --permanent --add-port="${p}/udp" >/dev/null 2>&1
+    done
+    firewall-cmd --reload >/dev/null 2>&1 || true
+  fi
+  # ufw：仅当已启用时加规则
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+    for p in $ports; do
+      ufw allow "${p}/tcp" >/dev/null 2>&1
+      ufw allow "${p}/udp" >/dev/null 2>&1
+    done
+  fi
+  # iptables：显式加 ACCEPT 规则（已存在则跳过，不动其他规则）
   if command -v iptables >/dev/null 2>&1; then
-    iptables -P INPUT ACCEPT >/dev/null 2>&1 || true
-    iptables -P FORWARD ACCEPT >/dev/null 2>&1 || true
-    iptables -P OUTPUT ACCEPT >/dev/null 2>&1 || true
-    iptables -F >/dev/null 2>&1 || true
-    iptables -X >/dev/null 2>&1 || true
+    for p in $ports; do
+      iptables -C INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null \
+        || iptables -I INPUT 1 -p tcp --dport "$p" -j ACCEPT 2>/dev/null || true
+      iptables -C INPUT -p udp --dport "$p" -j ACCEPT 2>/dev/null \
+        || iptables -I INPUT 1 -p udp --dport "$p" -j ACCEPT 2>/dev/null || true
+    done
+    # 持久化（尽力而为）
     command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save >/dev/null 2>&1 || true
     service iptables save >/dev/null 2>&1 || true
   fi
@@ -694,6 +726,7 @@ do_change_ports() {
   read -rp "AnyTLS [$PORT_ANYTLS]: " p; [[ -n "$p" ]] && PORT_ANYTLS="$p"
   save_env
   write_config
+  open_firewall
   setup_service
   start_argo
   print_links
@@ -743,12 +776,12 @@ case "$ACTION" in
     detect_os
     detect_arch
     install_deps
-    open_firewall
     install_singbox
     setup_shortcut
     gen_certs
     load_or_gen_identity
     write_config
+    open_firewall
     setup_service
     start_argo
     print_links
