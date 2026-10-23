@@ -63,6 +63,19 @@ x86_64 / arm64 / armv7 架构。
 
 另外精简掉了原版的 Warp 分流、订阅、Telegram 推送等附加功能，只保留核心代理能力。
 
+## 管理菜单与快捷命令
+
+全自动版安装时会自动装好 `sbox` 快捷命令，之后管理不需要再下载脚本：
+
+```bash
+sudo sbox            # 进入管理菜单
+sudo sbox <动作>     # 直接执行：change-uuid | change-reality | change-cert
+                     #   | change-argo | change-ports | show-links | restart | uninstall
+```
+
+管理菜单（`sudo sbox`）：更换 UUID、更新 Reality 密钥对、更新自签证书、
+Argo 隧道管理、更换端口、查看节点链接、重启服务、卸载。
+
 ## 卸载
 
 ```bash
