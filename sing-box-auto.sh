@@ -18,7 +18,7 @@
 #   动作参数：menu | change-uuid | change-reality | change-cert | change-argo
 #            | change-ports | show-links | restart | uninstall
 #   快捷命令：安装时会自动装好 sbox 命令（/usr/local/bin/sbox），之后直接打
-#            sudo sbox 就进管理菜单，sudo sbox <动作> 执行对应操作
+#            sbox 就进管理菜单（非 root 会自动 sudo 提权），sbox <动作> 执行对应操作
 #
 # 特性：
 #   - 全程无交互：UUID、密码、Reality 密钥对全部自动生成
@@ -59,6 +59,10 @@ SNI_REALITY="apple.com"        # Reality 伪装域名（原版默认）
 SNI_SELF="www.bing.com"        # 自签证书 CN
 
 if [[ "$EUID" -ne 0 ]]; then
+  # sbox 快捷命令：非 root 时自动提权，opc 下直接打 sbox 就能进菜单
+  if [[ "$(basename "$0")" == "sbox" ]]; then
+    exec sudo "$0" "$@"
+  fi
   echo "[错误] 请以 root 运行，例如：sudo bash $0"
   exit 1
 fi
@@ -210,7 +214,7 @@ setup_shortcut() {
     "https://raw.githubusercontent.com/tobaye/sing-box-auto/main/sing-box-auto.sh" \
     -o /usr/local/bin/sbox; then
     chmod +x /usr/local/bin/sbox
-    echo "[信息] 快捷命令已安装：sudo sbox（直接进管理菜单）"
+    echo "[信息] 快捷命令已安装：直接打 sbox 进管理菜单（自动提权）"
   else
     echo "[警告] sbox 快捷命令安装失败，可手动下载脚本使用"
   fi
