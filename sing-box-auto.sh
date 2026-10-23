@@ -834,24 +834,34 @@ port_listening() {
   esac
 }
 
-# 菜单顶部显示各协议端口监听状态（仿甬哥脚本）
+# 菜单端口状态（排版仿甬哥 showprotocol）
 show_port_status() {
-  echo "---------- 端口状态 ----------"
+  local _d argo_st="未开启"
+  if [[ -f "$SB_DIR/argo.env" ]] && grep -q '^ARGO_MODE="fixed"' "$SB_DIR/argo.env" 2>/dev/null; then
+    argo_st="固定隧道：$(grep '^ARGO_DOMAIN=' "$SB_DIR/argo.env" 2>/dev/null | cut -d'"' -f2)"
+  else
+    _d="$(grep -a -o 'https://[^ "]*trycloudflare.com' "$SB_DIR/argo.log" 2>/dev/null | head -n 2 | tail -n 1 | sed 's|https://||' || true)"
+    [[ -n "$_d" ]] && argo_st="临时隧道：$_d"
+  fi
+  echo "Sing-box节点端口状态如下："
   local item name proto port st
   for item in \
-    "VLESS+Reality|tcp|$PORT_VLESS" \
-    "VMess+WS|tcp|$PORT_VMESS" \
-    "AnyTLS|tcp|$PORT_ANYTLS" \
-    "Hysteria2|udp|$PORT_HY2" \
-    "TUIC|udp|$PORT_TUIC"; do
+    "Vless-reality|tcp|$PORT_VLESS" \
+    "Vmess-ws|tcp|$PORT_VMESS" \
+    "Hysteria-2|udp|$PORT_HY2" \
+    "Tuic-v5|udp|$PORT_TUIC" \
+    "Anytls|tcp|$PORT_ANYTLS"; do
     name="${item%%|*}"; proto="${item#*|}"; proto="${proto%%|*}"; port="${item##*|}"
     if port_listening "$proto" "$port"; then st="监听中"; else st="未监听"; fi
-    echo "$name ($proto/$port)：$st"
+    if [[ "$name" == "Vmess-ws" ]]; then
+      printf '🚀【 %-13s 】端口:%-5s  状态:%s  Argo:%s\n' "$name" "$port" "$st" "$argo_st"
+    else
+      printf '🚀【 %-13s 】端口:%-5s  状态:%s\n' "$name" "$port" "$st"
+    fi
   done
   if command -v systemctl >/dev/null 2>&1; then
-    echo "服务状态：$(systemctl is-active sing-box 2>/dev/null || echo '未知')"
+    echo "Sing-box状态：$(systemctl is-active sing-box 2>/dev/null || echo '未知')"
   fi
-  echo "------------------------------"
 }
 
 show_menu() {
