@@ -169,7 +169,7 @@ port_in_use() {
   return 1
 }
 
-# 从默认端口开始，被占用就 +1，直到找到空闲端口
+# 随机分配空闲端口（10000-60000），避开已占用和本次已分配的
 rand_port() {
   # 在 10000-60000 内随机取一个空闲端口
   # 参数 $1：已分配端口列表（空格分隔，如 " 12345 23456 "），避免 5 个协议互相冲突
@@ -587,7 +587,8 @@ start_argo() {
   if [[ -n "${ARGO_DOMAIN:-}" ]]; then
     echo "[信息] Argo 临时域名：$ARGO_DOMAIN（重启后会变化）"
     if command -v crontab >/dev/null 2>&1; then
-      (crontab -l 2>/dev/null | grep -v "cloudflared tunnel --url"
+      # 宽匹配：切回临时隧道时，把固定隧道的开机自启也清掉，避免重启后双隧道齐跑
+      (crontab -l 2>/dev/null | grep -v "cloudflared.*tunnel"
        echo "@reboot sleep 15 && $cf tunnel --url http://localhost:${PORT_VMESS} --edge-ip-version auto --no-autoupdate --protocol http2 > $SB_DIR/argo.log 2>&1 &") | crontab - >/dev/null 2>&1 || true
     fi
   else
@@ -676,7 +677,8 @@ do_uninstall() {
   pkill -f "$SB_DIR/sing-box run" >/dev/null 2>&1 || true
   pkill -f "cloudflared.*tunnel" >/dev/null 2>&1 || true
   if command -v crontab >/dev/null 2>&1; then
-    (crontab -l 2>/dev/null | grep -v "sing-box run" | grep -v "cloudflared tunnel --url") | crontab - >/dev/null 2>&1 || true
+    # 注意：固定隧道和临时隧道的 crontab 格式不同，用宽匹配一起清掉
+    (crontab -l 2>/dev/null | grep -v "sing-box run" | grep -v "cloudflared.*tunnel") | crontab - >/dev/null 2>&1 || true
   fi
   rm -rf "$SB_DIR" "$LINKS_FILE"
   rm -f /usr/local/bin/sbox /usr/bin/sbox
