@@ -15,13 +15,17 @@
 #   卸载：curl -fsSL https://raw.githubusercontent.com/tobaye/sing-box-auto/main/sing-box-auto.sh | sudo bash -s -- uninstall
 #   管理菜单：curl -fsSL https://raw.githubusercontent.com/tobaye/sing-box-auto/main/sing-box-auto.sh | sudo bash -s -- menu
 #   （或下载后 sudo bash sing-box-auto.sh menu）
-#   快捷命令：menu | change-uuid | change-reality | change-cert | change-argo
-#            | change-ports | show-links | restart | uninstall
+#   动作参数：menu | change-uuid | change-reality | change-cert | change-argo
+#            | change-ports | show-links | restart | uninstall | update-script
+#   快捷命令：安装时会自动装好 sbox 命令（/usr/local/bin/sbox），之后直接打
+#            sbox 就进管理菜单（非 root 会自动 sudo 提权），sbox <动作> 执行对应操作
 #
 # 特性：
 #   - 全程无交互：UUID、密码、Reality 密钥对全部自动生成
-#   - 默认端口：VLESS 29821 / VMess-WS 20867 / Hy2 37724 / TUIC 60571 / AnyTLS 24878，
-#     端口被占用时自动递增
+#   - 随机端口：新装时 5 个协议端口在 10000-60000 内随机分配（互不冲突，避开已占用），
+#     多台服务器端口各不相同；重跑/升级保留已有端口，菜单 5 可手动改
+#   - 防火墙：自动从配置提取监听端口并在 firewalld/ufw/iptables 放行，
+#     配置增减协议或换端口时自动跟上
 #   - 证书：自动生成 www.bing.com 自签证书（供 Hy2/TUIC/AnyTLS/VMess-WS 使用）
 #   - 幂等：重复运行保留已有 UUID/端口/密钥，只重写配置并重启；也能识别原版
 #     yonggekkk 脚本留下的配置并导入
@@ -33,23 +37,27 @@
 set -euo pipefail
 
 #----------------------------- 0. 参数与常量 ---------------------------------
-ACTION="${1:-install}"          # install | uninstall | menu | change-uuid | change-reality | change-cert | change-argo | change-ports | show-links | restart
+# 通过 sbox 快捷命令调用且无参数时默认进菜单；其他方式无参数默认执行安装
+if [[ "$(basename "$0")" == "sbox" && $# -eq 0 ]]; then
+  ACTION="menu"
+else
+  ACTION="${1:-install}"        # install | uninstall | menu | change-uuid | change-reality | change-cert | change-argo | change-ports | show-links | restart | update-script
+fi
 
 SB_DIR="/etc/s-box"
 ENV_FILE="$SB_DIR/auto.env"    # 持久化：UUID/端口/密钥，重跑时复用
 LINKS_FILE="/root/singbox-links.txt"
 
-# 默认端口：被占用时自动递增寻找空闲端口
-DEF_PORT_VLESS=29821
-DEF_PORT_VMESS=20867
-DEF_PORT_HY2=37724
-DEF_PORT_TUIC=60571
-DEF_PORT_ANYTLS=24878
+# 端口分配：新装时随机（10000-60000），重跑/升级保留已有端口（见 load_or_gen_identity）
 
 SNI_REALITY="apple.com"        # Reality 伪装域名（原版默认）
 SNI_SELF="www.bing.com"        # 自签证书 CN
 
 if [[ "$EUID" -ne 0 ]]; then
+  # sbox 快捷命令：非 root 时自动提权，opc 下直接打 sbox 就能进菜单
+  if [[ "$(basename "$0")" == "sbox" ]]; then
+    exec sudo "$0" "$@"
+  fi
   echo "[错误] 请以 root 运行，例如：sudo bash $0"
   exit 1
 fi
@@ -82,16 +90,71 @@ detect_arch() {
 }
 
 install_deps() {
-  echo "[信息] 安装依赖（curl/jq/openssl/tar/iproute2）…"
+  # 先检查缺什么：齐了就直接跳过，dnf 在小内存机器上又慢又吃内存
+  local need="" pkgs="" c
+  command -v curl >/dev/null 2>&1 || need="$need curl"
+  command -v jq >/dev/null 2>&1 || need="$need jq"
+  command -v openssl >/dev/null 2>&1 || need="$need openssl"
+  command -v tar >/dev/null 2>&1 || need="$need tar"
+  { command -v ss >/dev/null 2>&1 || command -v ip >/dev/null 2>&1; } || need="$need iproute"
+  command -v crontab >/dev/null 2>&1 || need="$need cron"
+  if [[ -z "${need// }" ]]; then
+    echo "[信息] 依赖已齐全，跳过安装"
+    return 0
+  fi
+  # 包名映射（cron 在不同发行版名字不一样）
+  for c in $need; do
+    case "$c" in
+      cron)
+        case "$PKG" in
+          apt) pkgs="$pkgs cron" ;;
+          apk) pkgs="$pkgs dcron" ;;
+          *) pkgs="$pkgs cronie" ;;
+        esac ;;
+      *) pkgs="$pkgs $c" ;;
+    esac
+  done
+  echo "[信息] 安装缺失依赖：${pkgs} …"
   case "$PKG" in
     apt) apt-get update -y >/dev/null 2>&1 || true
-         DEBIAN_FRONTEND=noninteractive apt-get install -y curl jq openssl tar iproute2 ca-certificates cron >/dev/null 2>&1 || true ;;
-    dnf) dnf install -y curl jq openssl tar iproute cronie >/dev/null 2>&1 || true ;;
-    yum) yum install -y curl jq openssl tar iproute cronie >/dev/null 2>&1 || true ;;
-    apk) apk add --no-cache curl jq openssl tar iproute2 ca-certificates dcron >/dev/null 2>&1 || true ;;
+         DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs >/dev/null 2>&1 || true ;;
+    dnf) dnf install -y --setopt=install_weak_deps=False $pkgs >/dev/null 2>&1 || true ;;
+    yum) yum install -y $pkgs >/dev/null 2>&1 || true ;;
+    apk) apk add --no-cache $pkgs >/dev/null 2>&1 || true ;;
   esac
   command -v curl >/dev/null 2>&1 || { echo "[错误] curl 安装失败"; exit 1; }
   command -v jq >/dev/null 2>&1 || { echo "[错误] jq 安装失败"; exit 1; }
+}
+
+check_memory() {
+  # 小内存机器预警：dnf 单次可占 350M+，无 swap 时易 OOM 卡死整机（实测 498M 机器被顶爆过）
+  local mem_kb swap_kb
+  mem_kb=$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null || echo 0)
+  swap_kb=$(awk '/^SwapTotal:/{print $2}' /proc/meminfo 2>/dev/null || echo 0)
+  if [ "$mem_kb" -gt 0 ] && [ "$mem_kb" -lt 1048576 ] && [ "$swap_kb" -eq 0 ]; then
+    echo "[警告] 内存较小 ($((mem_kb / 1024))M) 且无 swap，装依赖时 dnf 可能 OOM 导致卡死"
+    echo "[警告] 建议先加 swap：fallocate -l 2G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile"
+    echo "[警告] 继续安装…"
+  fi
+}
+
+disable_dnf_makecache() {
+  # 小内存机器（<2G）禁用 dnf-makecache 定时器：后台自动跑 dnf 易致 OOM
+  # 只影响软件源缓存的自动更新，手动 dnf 不受影响
+  case "$PKG" in
+    dnf|yum) ;;
+    *) return 0 ;;
+  esac
+  command -v systemctl >/dev/null 2>&1 || return 0
+  systemctl list-unit-files 2>/dev/null | grep -q "^dnf-makecache\.timer" || return 0
+  local mem_kb
+  mem_kb=$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null || echo 0)
+  if [ "$mem_kb" -gt 0 ] && [ "$mem_kb" -lt 2097152 ]; then
+    if systemctl is-enabled --quiet dnf-makecache.timer 2>/dev/null; then
+      systemctl disable --now dnf-makecache.timer >/dev/null 2>&1 || true
+      echo "[信息] 已禁用 dnf-makecache 定时器（小内存机器，后台自动 dnf 易致 OOM）"
+    fi
+  fi
 }
 
 #----------------------------- 2. 端口分配 -----------------------------------
@@ -106,31 +169,78 @@ port_in_use() {
   return 1
 }
 
-# 从默认端口开始，被占用就 +1，直到找到空闲端口
-alloc_port() {
-  local p="$1" guard=0
-  while port_in_use "$p"; do
-    p=$((p + 1)); guard=$((guard + 1))
-    if [[ $guard -gt 2000 ]]; then echo "[错误] 找不到可用端口" >&2; exit 1; fi
+# 随机分配空闲端口（10000-60000），避开已占用和本次已分配的
+rand_port() {
+  # 在 10000-60000 内随机取一个空闲端口
+  # 参数 $1：已分配端口列表（空格分隔，如 " 12345 23456 "），避免 5 个协议互相冲突
+  local allocated="$1" p tries=0
+  while (( tries < 100 )); do
+    p=$(( (RANDOM * 32768 + RANDOM) % 50001 + 10000 ))
+    if [[ "$allocated" != *" $p "* ]] && ! port_in_use "$p"; then
+      echo "$p"
+      return 0
+    fi
+    tries=$((tries + 1))
   done
-  echo "$p"
+  echo "[错误] 无法分配随机空闲端口" >&2
+  exit 1
 }
 
 #----------------------------- 3. 防火墙放行 ---------------------------------
-# 对应原版 openyn→close：默认选"是"，直接放行（原版回车默认值也是执行）
+# 自适应放行：从已生成的 sing-box 配置里提取所有 inbound 监听端口，
+# TCP+UDP 双开。以后脚本增减协议、换端口，这里自动跟上，无需维护端口列表。
+# 必须在 write_config 之后调用。云厂商安全组/安全列表需在控制台另行放行。
 open_firewall() {
-  echo "[信息] 放行防火墙…"
-  systemctl stop firewalld >/dev/null 2>&1 || true
-  systemctl disable firewalld >/dev/null 2>&1 || true
-  ufw disable >/dev/null 2>&1 || true
+  local ports=""
+  if [[ -f "$SB_DIR/sb.json" ]] && command -v jq >/dev/null 2>&1; then
+    ports=$(jq -r '.inbounds[].listen_port // empty' "$SB_DIR/sb.json" 2>/dev/null | sort -un | tr '\n' ' ' || true)
+  fi
+  # 回退：配置文件不存在或 jq 不可用时，用 PORT_* 变量
+  if [[ -z "${ports// }" ]]; then
+    ports="${PORT_VLESS:-} ${PORT_VMESS:-} ${PORT_HY2:-} ${PORT_TUIC:-} ${PORT_ANYTLS:-}"
+  fi
+  if [[ -z "${ports// }" ]]; then
+    echo "[警告] 未找到需要放行的端口，跳过防火墙设置"
+    return 0
+  fi
+  echo "[信息] 放行防火墙端口：${ports}（TCP+UDP）…"
+  local p
+  # firewalld：仅当正在运行时加规则，不擅自启停它
+  if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
+    for p in $ports; do
+      firewall-cmd --permanent --add-port="${p}/tcp" >/dev/null 2>&1
+      firewall-cmd --permanent --add-port="${p}/udp" >/dev/null 2>&1
+    done
+    firewall-cmd --reload >/dev/null 2>&1 || true
+  fi
+  # ufw：仅当已启用时加规则
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+    for p in $ports; do
+      ufw allow "${p}/tcp" >/dev/null 2>&1
+      ufw allow "${p}/udp" >/dev/null 2>&1
+    done
+  fi
+  # iptables：显式加 ACCEPT 规则（已存在则跳过，不动其他规则）
   if command -v iptables >/dev/null 2>&1; then
-    iptables -P INPUT ACCEPT >/dev/null 2>&1 || true
-    iptables -P FORWARD ACCEPT >/dev/null 2>&1 || true
-    iptables -P OUTPUT ACCEPT >/dev/null 2>&1 || true
-    iptables -F >/dev/null 2>&1 || true
-    iptables -X >/dev/null 2>&1 || true
+    for p in $ports; do
+      iptables -C INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null \
+        || iptables -I INPUT 1 -p tcp --dport "$p" -j ACCEPT 2>/dev/null || true
+      iptables -C INPUT -p udp --dport "$p" -j ACCEPT 2>/dev/null \
+        || iptables -I INPUT 1 -p udp --dport "$p" -j ACCEPT 2>/dev/null || true
+    done
+    # 持久化（尽力而为）
     command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save >/dev/null 2>&1 || true
     service iptables save >/dev/null 2>&1 || true
+  fi
+  # ip6tables：纯 IPv6 机器上 iptables 管不到 v6，需单独放行
+  if command -v ip6tables >/dev/null 2>&1; then
+    for p in $ports; do
+      ip6tables -C INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null \
+        || ip6tables -I INPUT 1 -p tcp --dport "$p" -j ACCEPT 2>/dev/null || true
+      ip6tables -C INPUT -p udp --dport "$p" -j ACCEPT 2>/dev/null \
+        || ip6tables -I INPUT 1 -p udp --dport "$p" -j ACCEPT 2>/dev/null || true
+    done
+    service ip6tables save >/dev/null 2>&1 || true
   fi
   command -v setenforce >/dev/null 2>&1 && setenforce 0 >/dev/null 2>&1 || true
   echo "[信息] 防火墙已放行"
@@ -163,6 +273,40 @@ install_singbox() {
   echo "[信息] sing-box 安装成功：$("$SB_DIR/sing-box" version | awk '/version/{print $NF}')"
 }
 
+#----------------------------- 4.1 快捷命令 ----------------------------------
+# 把本脚本安装为 sbox 系统命令：sudo sbox 进菜单，sudo sbox <动作> 直达操作
+# 从 GitHub 拉取最新脚本（带防缓存 + 备用源），成功返回 0
+fetch_latest_script() {
+  local dest="$1"
+  local ts url
+  ts=$(date +%s)
+  local urls=(
+    "https://raw.githubusercontent.com/tobaye/sing-box-auto/main/sing-box-auto.sh?t=${ts}"
+    "https://cdn.jsdelivr.net/gh/tobaye/sing-box-auto@main/sing-box-auto.sh"
+  )
+  for url in "${urls[@]}"; do
+    if curl -fsSL --max-time 60 --retry 2 "$url" -o "$dest" \
+       && grep -q "sing-box 全自动一键安装脚本" "$dest" \
+       && bash -n "$dest"; then
+      return 0
+    fi
+    echo "[警告] 从 ${url%%\?*} 获取失败，尝试备用源…"
+  done
+  return 1
+}
+
+setup_shortcut() {
+  echo "[信息] 安装 sbox 快捷命令…"
+  if fetch_latest_script /usr/local/bin/sbox; then
+    chmod +x /usr/local/bin/sbox
+    # 部分系统 root 的 PATH（sudo secure_path）不含 /usr/local/bin，加个软链接兜底
+    ln -sf /usr/local/bin/sbox /usr/bin/sbox 2>/dev/null || true
+    echo "[信息] 快捷命令已安装：直接打 sbox 进管理菜单（自动提权）"
+  else
+    echo "[警告] sbox 快捷命令安装失败，可手动下载脚本使用"
+  fi
+}
+
 #----------------------------- 5. 自签证书 -----------------------------------
 # 对应原版 inscertificate：默认选"1"（不申请 Acme，直接用自签证书）
 gen_certs() {
@@ -170,10 +314,30 @@ gen_certs() {
     echo "[信息] 自签证书已存在，跳过生成"
     return 0
   fi
-  echo "[信息] 生成自签证书（CN=$SNI_SELF）…"
+  echo "[信息] 生成自签证书（CN=$SNI_SELF，含 SAN）…"
   openssl ecparam -genkey -name prime256v1 -out "$SB_DIR/private.key" 2>/dev/null
-  openssl req -new -x509 -days 36500 -key "$SB_DIR/private.key" \
-    -out "$SB_DIR/cert.pem" -subj "/CN=$SNI_SELF" 2>/dev/null
+  # 必须带 SAN：现代 TLS 会拒绝只有 CN 的证书
+  # （x509: certificate relies on legacy Common Name field）
+  if ! openssl req -new -x509 -days 36500 -key "$SB_DIR/private.key" \
+      -out "$SB_DIR/cert.pem" -subj "/CN=$SNI_SELF" \
+      -addext "subjectAltName=DNS:$SNI_SELF" 2>/dev/null; then
+    # 老版本 OpenSSL 不支持 -addext，回退到配置文件方式
+    local _cnf
+    _cnf=$(mktemp)
+    cat > "$_cnf" <<EOF
+[req]
+distinguished_name = dn
+x509_extensions = ext
+prompt = no
+[dn]
+CN = $SNI_SELF
+[ext]
+subjectAltName = DNS:$SNI_SELF
+EOF
+    openssl req -new -x509 -days 36500 -key "$SB_DIR/private.key" \
+      -out "$SB_DIR/cert.pem" -config "$_cnf" 2>/dev/null
+    rm -f "$_cnf"
+  fi
   [[ -f "$SB_DIR/cert.pem" ]] || { echo "[错误] 证书生成失败"; exit 1; }
   echo "[信息] 自签证书生成成功"
 }
@@ -199,12 +363,13 @@ load_or_gen_identity() {
   if [[ -f "$ENV_FILE" ]]; then
     # shellcheck disable=SC1090
     . "$ENV_FILE"
-    # 兼容精简版写下的 env：缺失的协议端口按默认分配
-    [[ -z "${PORT_VLESS:-}" ]] && PORT_VLESS=$(alloc_port "$DEF_PORT_VLESS")
-    [[ -z "${PORT_VMESS:-}" ]] && PORT_VMESS=$(alloc_port "$DEF_PORT_VMESS")
-    [[ -z "${PORT_HY2:-}" ]] && PORT_HY2=$(alloc_port "$DEF_PORT_HY2")
-    [[ -z "${PORT_TUIC:-}" ]] && PORT_TUIC=$(alloc_port "$DEF_PORT_TUIC")
-    [[ -z "${PORT_ANYTLS:-}" ]] && PORT_ANYTLS=$(alloc_port "$DEF_PORT_ANYTLS")
+    # 兼容精简版写下的 env：缺失的协议端口随机分配
+    local used=" ${PORT_VLESS:-} ${PORT_VMESS:-} ${PORT_HY2:-} ${PORT_TUIC:-} ${PORT_ANYTLS:-} "
+    [[ -z "${PORT_VLESS:-}" ]] && PORT_VLESS=$(rand_port "$used") && used+=" $PORT_VLESS "
+    [[ -z "${PORT_VMESS:-}" ]] && PORT_VMESS=$(rand_port "$used") && used+=" $PORT_VMESS "
+    [[ -z "${PORT_HY2:-}" ]] && PORT_HY2=$(rand_port "$used") && used+=" $PORT_HY2 "
+    [[ -z "${PORT_TUIC:-}" ]] && PORT_TUIC=$(rand_port "$used") && used+=" $PORT_TUIC "
+    [[ -z "${PORT_ANYTLS:-}" ]] && PORT_ANYTLS=$(rand_port "$used") && used+=" $PORT_ANYTLS "
     if [[ -n "${UUID:-}" && -n "${PRIVKEY:-}" && -n "${PUBKEY:-}" && -n "${SHORTID:-}" ]]; then
       echo "[信息] 检测到已有配置，UUID/端口/密钥保持不变（幂等重跑）"
       save_env
@@ -222,7 +387,7 @@ load_or_gen_identity() {
       PORT_HY2=$(jq -r '.inbounds[2].listen_port' "$SB_DIR/sb.json" 2>/dev/null || true)
       PORT_TUIC=$(jq -r '.inbounds[3].listen_port' "$SB_DIR/sb.json" 2>/dev/null || true)
       PORT_ANYTLS=$(jq -r '.inbounds[4].listen_port // empty' "$SB_DIR/sb.json" 2>/dev/null || true)
-      [[ -z "$PORT_ANYTLS" || "$PORT_ANYTLS" == "null" ]] && PORT_ANYTLS="$DEF_PORT_ANYTLS"
+      [[ -z "$PORT_ANYTLS" || "$PORT_ANYTLS" == "null" ]] && PORT_ANYTLS=$(rand_port " $PORT_VLESS $PORT_VMESS $PORT_HY2 $PORT_TUIC ")
       PRIVKEY=$(jq -r '.inbounds[0].tls.reality.private_key // empty' "$SB_DIR/sb.json" 2>/dev/null || true)
       SHORTID=$(jq -r '.inbounds[0].tls.reality.short_id[0] // empty' "$SB_DIR/sb.json" 2>/dev/null || true)
       PUBKEY="$(cat "$SB_DIR/public.key" 2>/dev/null || true)"
@@ -249,11 +414,12 @@ load_or_gen_identity() {
   if [[ -z "$PRIVKEY" || -z "$PUBKEY" || -z "$SHORTID" ]]; then
     echo "[错误] Reality 密钥生成失败"; exit 1
   fi
-  PORT_VLESS=$(alloc_port "$DEF_PORT_VLESS")
-  PORT_VMESS=$(alloc_port "$DEF_PORT_VMESS")
-  PORT_HY2=$(alloc_port "$DEF_PORT_HY2")
-  PORT_TUIC=$(alloc_port "$DEF_PORT_TUIC")
-  PORT_ANYTLS=$(alloc_port "$DEF_PORT_ANYTLS")
+  local used=" "
+  PORT_VLESS=$(rand_port "$used"); used+=" $PORT_VLESS "
+  PORT_VMESS=$(rand_port "$used"); used+=" $PORT_VMESS "
+  PORT_HY2=$(rand_port "$used"); used+=" $PORT_HY2 "
+  PORT_TUIC=$(rand_port "$used"); used+=" $PORT_TUIC "
+  PORT_ANYTLS=$(rand_port "$used"); used+=" $PORT_ANYTLS "
   echo "[信息] 端口分配：VLESS=$PORT_VLESS VMess-WS=$PORT_VMESS Hy2=$PORT_HY2 TUIC=$PORT_TUIC AnyTLS=$PORT_ANYTLS"
   save_env
 }
@@ -332,6 +498,16 @@ EOF
 }
 
 #----------------------------- 8. 系统服务 ------------------------------------
+# SELinux：Enforcing 会拦截 sing-box 的出站连接（avc denied name_connect），切为 permissive
+fix_selinux() {
+  if command -v getenforce >/dev/null 2>&1 && [[ "$(getenforce 2>/dev/null)" == "Enforcing" ]]; then
+    echo "[信息] 检测到 SELinux 为 Enforcing，切换为 Permissive（否则代理出站会被拦截）…"
+    setenforce 0 2>/dev/null || true
+    [[ -f /etc/selinux/config ]] && sed -i 's/^SELINUX=enforcing/SELINUX=permissive/' /etc/selinux/config
+    echo "[信息] SELinux 已切换为 Permissive（重启后依然有效）"
+  fi
+}
+
 setup_service() {
   echo "[信息] 配置并启动 sing-box 服务…"
   if [[ -d /run/systemd/system ]] || pidof systemd >/dev/null 2>&1; then
@@ -410,17 +586,25 @@ start_argo() {
   nohup "$cf" tunnel --url "http://localhost:${PORT_VMESS}" \
     --edge-ip-version auto --no-autoupdate --protocol http2 \
     > "$SB_DIR/argo.log" 2>&1 &
-  echo "[信息] 等待 Cloudflare 分配临时域名（约 15 秒）…"
-  sleep 15
-  ARGO_DOMAIN="$(grep -a -o 'https://[^ "]*trycloudflare.com' "$SB_DIR/argo.log" 2>/dev/null | head -n 2 | tail -n 1 | sed 's|https://||' || true)"
+  echo "[信息] 等待 Cloudflare 分配临时域名（最多约 60 秒）…"
+  ARGO_DOMAIN=""
+  local _i
+  for _i in $(seq 1 20); do
+    sleep 3
+    ARGO_DOMAIN="$(grep -a -o 'https://[^ "]*trycloudflare.com' "$SB_DIR/argo.log" 2>/dev/null | head -n 2 | tail -n 1 | sed 's|https://||' || true)"
+    [[ -n "$ARGO_DOMAIN" ]] && break
+  done
   if [[ -n "${ARGO_DOMAIN:-}" ]]; then
     echo "[信息] Argo 临时域名：$ARGO_DOMAIN（重启后会变化）"
     if command -v crontab >/dev/null 2>&1; then
-      (crontab -l 2>/dev/null | grep -v "cloudflared tunnel --url"
+      # 宽匹配：切回临时隧道时，把固定隧道的开机自启也清掉，避免重启后双隧道齐跑
+      (crontab -l 2>/dev/null | grep -v "cloudflared.*tunnel"
        echo "@reboot sleep 15 && $cf tunnel --url http://localhost:${PORT_VMESS} --edge-ip-version auto --no-autoupdate --protocol http2 > $SB_DIR/argo.log 2>&1 &") | crontab - >/dev/null 2>&1 || true
     fi
   else
     echo "[警告] 未能获取 Argo 域名，跳过 VMess+Argo（不影响其他 5 种协议）"
+    echo "[提示] 隧道日志最后几行："
+    tail -n 5 "$SB_DIR/argo.log" 2>/dev/null || true
     ARGO_DOMAIN=""
   fi
 }
@@ -452,7 +636,7 @@ print_links() {
   vm_link="vmess://$(printf '{"add":"%s","aid":"0","host":"%s","id":"%s","net":"ws","path":"%s-vm","port":"%s","ps":"vm-ws-%s","tls":"","type":"none","v":"2"}' \
     "$ip" "$SNI_SELF" "$UUID" "$UUID" "$PORT_VMESS" "$host" | b64)"
 
-  hy2_link="hysteria2://${UUID}@${ip}:${PORT_HY2}?security=tls&alpn=h3&insecure=0&allowInsecure=0&sni=${SNI_SELF}&pinSHA256=${shasum_v}#hy2-${host}"
+  hy2_link="hysteria2://${UUID}@${ip}:${PORT_HY2}?security=tls&alpn=h3&insecure=1&allowInsecure=1&sni=${SNI_SELF}#hy2-${host}"
 
   tuic_link="tuic://${UUID}:${UUID}@${ip}:${PORT_TUIC}?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=${SNI_SELF}&insecure=1&allowInsecure=1&allow_insecure=1#tu5-${host}"
 
@@ -503,9 +687,11 @@ do_uninstall() {
   pkill -f "$SB_DIR/sing-box run" >/dev/null 2>&1 || true
   pkill -f "cloudflared.*tunnel" >/dev/null 2>&1 || true
   if command -v crontab >/dev/null 2>&1; then
-    (crontab -l 2>/dev/null | grep -v "sing-box run" | grep -v "cloudflared tunnel --url") | crontab - >/dev/null 2>&1 || true
+    # 注意：固定隧道和临时隧道的 crontab 格式不同，用宽匹配一起清掉
+    (crontab -l 2>/dev/null | grep -v "sing-box run" | grep -v "cloudflared.*tunnel") | crontab - >/dev/null 2>&1 || true
   fi
   rm -rf "$SB_DIR" "$LINKS_FILE"
+  rm -f /usr/local/bin/sbox /usr/bin/sbox
   echo "[信息] 卸载完成"
 }
 
@@ -606,6 +792,13 @@ start_argo_fixed() {
 # 4. Argo 隧道管理子菜单
 do_argo_menu() {
   load_env_or_exit
+  # 载入 Argo 状态用于显示：固定隧道读 argo.env，临时隧道从日志恢复当前域名
+  if [[ -f "$SB_DIR/argo.env" ]]; then
+    # shellcheck disable=SC1090
+    . "$SB_DIR/argo.env" 2>/dev/null || true
+  elif [[ -z "${ARGO_DOMAIN:-}" ]]; then
+    ARGO_DOMAIN="$(grep -a -o 'https://[^ "]*trycloudflare.com' "$SB_DIR/argo.log" 2>/dev/null | head -n 2 | tail -n 1 | sed 's|https://||' || true)"
+  fi
   while true; do
     echo
     echo "---------- Argo 隧道管理 ----------"
@@ -617,8 +810,9 @@ do_argo_menu() {
     echo "1. 重启临时隧道（获取新域名）"
     echo "2. 设置固定隧道（需 Cloudflare Token）"
     echo "3. 切换回临时隧道"
+    echo "4. 重新抓取隧道域名（隧道在跑但没显示域名时用）"
     echo "0. 返回上级"
-    read -rp "请选择 [0-3]: " c
+    read -rp "请选择 [0-4]: " c
     case "$c" in
       1)
         rm -f "$SB_DIR/argo.env"
@@ -653,6 +847,16 @@ EOF
         start_argo
         print_links
         ;;
+      4)
+        ARGO_DOMAIN="$(grep -a -o 'https://[^ "]*trycloudflare.com' "$SB_DIR/argo.log" 2>/dev/null | head -n 2 | tail -n 1 | sed 's|https://||' || true)"
+        if [[ -n "$ARGO_DOMAIN" ]]; then
+          echo "[信息] 抓到域名：$ARGO_DOMAIN"
+          print_links
+        else
+          echo "[警告] 日志里还没有域名，隧道可能仍在启动中，稍后再试"
+          tail -n 5 "$SB_DIR/argo.log" 2>/dev/null || true
+        fi
+        ;;
       0) break ;;
       *) echo "[错误] 无效选择" ;;
     esac
@@ -672,6 +876,7 @@ do_change_ports() {
   read -rp "AnyTLS [$PORT_ANYTLS]: " p; [[ -n "$p" ]] && PORT_ANYTLS="$p"
   save_env
   write_config
+  open_firewall
   setup_service
   start_argo
   print_links
@@ -679,15 +884,74 @@ do_change_ports() {
   echo "[完成] 端口已更新"
 }
 
+# 9. 更新脚本到最新版（从 GitHub 拉取）
+do_update_script() {
+  echo "[信息] 正在从 GitHub 拉取最新脚本…"
+  local tmpfile
+  tmpfile=$(mktemp)
+  if fetch_latest_script "$tmpfile"; then
+    cp -f "$tmpfile" /usr/local/bin/sbox
+    chmod +x /usr/local/bin/sbox
+    rm -f "$tmpfile"
+    echo "[完成] 脚本已更新到最新版"
+    return 0
+  fi
+  rm -f "$tmpfile"
+  echo "[错误] 下载失败，请检查网络后重试"
+  return 1
+}
+
 # 主管理菜单
+# 检查端口是否在监听：$1=tcp|udp  $2=端口
+port_listening() {
+  case "$1" in
+    tcp) command -v ss >/dev/null 2>&1 && ss -tln 2>/dev/null | grep -qE "[:.]$2[[:space:]]" ;;
+    udp) command -v ss >/dev/null 2>&1 && ss -uln 2>/dev/null | grep -qE "[:.]$2[[:space:]]" ;;
+    *) return 1 ;;
+  esac
+}
+
+# 菜单端口状态（排版仿甬哥 showprotocol）
+show_port_status() {
+  local _d argo_st="未开启"
+  if [[ -f "$SB_DIR/argo.env" ]] && grep -q '^ARGO_MODE="fixed"' "$SB_DIR/argo.env" 2>/dev/null; then
+    argo_st="固定隧道：$(grep '^ARGO_DOMAIN=' "$SB_DIR/argo.env" 2>/dev/null | cut -d'"' -f2)"
+  else
+    _d="$(grep -a -o 'https://[^ "]*trycloudflare.com' "$SB_DIR/argo.log" 2>/dev/null | head -n 2 | tail -n 1 | sed 's|https://||' || true)"
+    [[ -n "$_d" ]] && argo_st="临时隧道：$_d"
+  fi
+  echo "Sing-box节点端口状态如下："
+  local item name proto port st
+  for item in \
+    "Vless-reality|tcp|$PORT_VLESS" \
+    "Vmess-ws|tcp|$PORT_VMESS" \
+    "Hysteria-2|udp|$PORT_HY2" \
+    "Tuic-v5|udp|$PORT_TUIC" \
+    "Anytls|tcp|$PORT_ANYTLS"; do
+    name="${item%%|*}"; proto="${item#*|}"; proto="${proto%%|*}"; port="${item##*|}"
+    if port_listening "$proto" "$port"; then st="监听中"; else st="未监听"; fi
+    if [[ "$name" == "Vmess-ws" ]]; then
+      printf '🚀【 %-13s 】端口:%-5s  状态:%s  Argo:%s\n' "$name" "$port" "$st" "$argo_st"
+    else
+      printf '🚀【 %-13s 】端口:%-5s  状态:%s\n' "$name" "$port" "$st"
+    fi
+  done
+  if command -v systemctl >/dev/null 2>&1; then
+    echo "Sing-box状态：$(systemctl is-active sing-box 2>/dev/null || echo '未知')"
+  fi
+}
+
 show_menu() {
   if [[ "$EUID" -ne 0 ]]; then
     echo "[错误] 请以 root 运行，例如：sudo bash $0 menu"
     exit 1
   fi
+  load_env_or_exit
   while true; do
     echo
     echo "================ sing-box 管理菜单 ================"
+    show_port_status
+    echo
     echo "1. 更换 UUID（全协议）"
     echo "2. 更新 Reality 密钥对"
     echo "3. 更新自签证书"
@@ -696,9 +960,10 @@ show_menu() {
     echo "6. 查看节点链接"
     echo "7. 重启 sing-box 服务"
     echo "8. 卸载"
+    echo "9. 更新脚本到最新版"
     echo "0. 退出"
     echo "==================================================="
-    read -rp "请选择 [0-8]: " choice
+    read -rp "请选择 [0-9]: " choice
     case "$choice" in
       1) do_change_uuid ;;
       2) do_change_reality ;;
@@ -708,6 +973,7 @@ show_menu() {
       6) load_env_or_exit; print_links ;;
       7) load_env_or_exit; setup_service; echo "[完成] 服务已重启" ;;
       8) do_uninstall; break ;;
+      9) if do_update_script; then exec /usr/local/bin/sbox menu; fi ;;
       0) echo "退出"; break ;;
       *) echo "[错误] 无效选择" ;;
     esac
@@ -720,12 +986,16 @@ case "$ACTION" in
   install)
     detect_os
     detect_arch
+    check_memory
     install_deps
-    open_firewall
+    disable_dnf_makecache
     install_singbox
+    setup_shortcut
     gen_certs
     load_or_gen_identity
     write_config
+    open_firewall
+    fix_selinux
     setup_service
     start_argo
     print_links
@@ -759,8 +1029,11 @@ case "$ACTION" in
   restart)
     load_env_or_exit; setup_service; echo "[完成] 服务已重启"
     ;;
+  update-script)
+    do_update_script
+    ;;
   *)
-    echo "用法：$0 [install|uninstall|menu|change-uuid|change-reality|change-cert|change-argo|change-ports|show-links|restart]"
+    echo "用法：$0 [install|uninstall|menu|change-uuid|change-reality|change-cert|change-argo|change-ports|show-links|restart|update-script]"
     exit 1
     ;;
 esac
