@@ -131,6 +131,37 @@ install_deps() {
   command -v jq >/dev/null 2>&1 || { echo "[错误] jq 安装失败"; exit 1; }
 }
 
+check_memory() {
+  # 小内存机器预警：dnf 单次可占 350M+，无 swap 时易 OOM 卡死整机（实测 498M 机器被顶爆过）
+  local mem_kb swap_kb
+  mem_kb=$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null || echo 0)
+  swap_kb=$(awk '/^SwapTotal:/{print $2}' /proc/meminfo 2>/dev/null || echo 0)
+  if [ "$mem_kb" -gt 0 ] && [ "$mem_kb" -lt 1048576 ] && [ "$swap_kb" -eq 0 ]; then
+    echo "[警告] 内存较小 ($((mem_kb / 1024))M) 且无 swap，装依赖时 dnf 可能 OOM 导致卡死"
+    echo "[警告] 建议先加 swap：fallocate -l 2G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile"
+    echo "[警告] 继续安装…"
+  fi
+}
+
+disable_dnf_makecache() {
+  # 小内存机器（<2G）禁用 dnf-makecache 定时器：后台自动跑 dnf 易致 OOM
+  # 只影响软件源缓存的自动更新，手动 dnf 不受影响
+  case "$PKG" in
+    dnf|yum) ;;
+    *) return 0 ;;
+  esac
+  command -v systemctl >/dev/null 2>&1 || return 0
+  systemctl list-unit-files 2>/dev/null | grep -q "^dnf-makecache\.timer" || return 0
+  local mem_kb
+  mem_kb=$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null || echo 0)
+  if [ "$mem_kb" -gt 0 ] && [ "$mem_kb" -lt 2097152 ]; then
+    if systemctl is-enabled --quiet dnf-makecache.timer 2>/dev/null; then
+      systemctl disable --now dnf-makecache.timer >/dev/null 2>&1 || true
+      echo "[信息] 已禁用 dnf-makecache 定时器（小内存机器，后台自动 dnf 易致 OOM）"
+    fi
+  fi
+}
+
 #----------------------------- 2. 端口分配 -----------------------------------
 # 端口是否被占用（TCP/UDP 一起查）
 port_in_use() {
@@ -939,7 +970,9 @@ case "$ACTION" in
   install)
     detect_os
     detect_arch
+    check_memory
     install_deps
+    disable_dnf_makecache
     install_singbox
     setup_shortcut
     gen_certs
