@@ -99,3 +99,5 @@ curl -fsSL https://raw.githubusercontent.com/tobaye/sing-box-auto/main/sing-box-
    重建；对稳定性要求高请以 VLESS + Reality 为主力。
 5. 自签证书的客户端（Hysteria2/TUIC/AnyTLS/VMess-WS）已在链接里带好
    `insecure=1` 或 `pinSHA256` 参数，导入即用，无需手动信任证书。
+6. **纯 IPv6 服务器**可用：sing-box 监听 `::` 双栈，防火墙自动放行 ip6tables，
+   客户端链接里的 IPv6 地址会自动加方括号。注意客户端那边也得有 IPv6 网络才能连上。
