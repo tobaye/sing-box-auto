@@ -73,8 +73,8 @@ sbox <动作>     # 直接执行：change-uuid | change-reality | change-cert
                 #   | change-argo | change-ports | show-links | restart | uninstall
 ```
 
-管理菜单（`sudo sbox`）：更换 UUID、更新 Reality 密钥对、更新自签证书、
-Argo 隧道管理、更换端口、查看节点链接、重启服务、卸载。
+管理菜单（`sbox`）：更换 UUID、更新 Reality 密钥对、更新自签证书、
+Argo 隧道管理、更换端口、查看节点链接、重启服务、卸载、更新脚本到最新版。
 
 ## 卸载
 
