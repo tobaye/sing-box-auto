@@ -12,9 +12,11 @@
 #
 # 特性：
 #   - 全程无交互：UUID、Reality 密钥对自动生成
-#   - 默认端口 29821，被占用时自动递增
+#   - 新装时端口在 10000-60000 随机分配（避开占用）；重跑保持原端口
 #   - 与 6 协议全自动版共用 /etc/s-box/auto.env，同机切换版本时 UUID/密钥/端口保持不变
 #   - 幂等：重复运行只重写配置并重启，不改变客户端链接
+#   - 小内存保护：<1G 无 swap 时预警；<2G 的 dnf/yum 系统禁用 dnf-makecache 定时器
+#   - SELinux Enforcing 自动切 Permissive（Oracle Linux）；防火墙含 ip6tables（纯 IPv6）
 #   - 安装后打印 vless:// 链接，并保存到 /root/singbox-links.txt
 #
 # 参考原版：https://github.com/yonggekkk/sing-box-yg/blob/main/sb.sh
@@ -28,7 +30,7 @@ SB_DIR="/etc/s-box"
 ENV_FILE="$SB_DIR/auto.env"    # 与全自动版共用：UUID/端口/密钥
 LINKS_FILE="/root/singbox-links.txt"
 
-DEF_PORT_VLESS=29821            # 默认端口，被占用时自动递增
+DEF_PORT_VLESS=29821            # 兜底默认端口（仅旧 env 缺端口时用；新装走随机）
 
 SNI_REALITY="apple.com"        # Reality 伪装域名（原版默认）
 
@@ -64,14 +66,98 @@ detect_arch() {
   echo "[信息] 架构：${ARCH}"
 }
 
+check_memory() {
+  # 小内存机器预警：dnf 单次可占 350M+，无 swap 时易 OOM 卡死整机（实测 498M 机器被顶爆过）
+  local mem_kb swap_kb
+  mem_kb=$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null || echo 0)
+  swap_kb=$(awk '/^SwapTotal:/{print $2}' /proc/meminfo 2>/dev/null || echo 0)
+  if [ "$mem_kb" -gt 0 ] && [ "$mem_kb" -lt 1048576 ] && [ "$swap_kb" -eq 0 ]; then
+    echo "[警告] 内存较小 ($((mem_kb / 1024))M) 且无 swap，装依赖时 dnf 可能 OOM 导致卡死"
+    echo "[警告] 建议先加 swap：fallocate -l 2G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile"
+    echo "[警告] 继续安装…"
+  fi
+}
+
+disable_dnf_makecache() {
+  # 小内存机器（<2G）禁用 dnf-makecache 定时器：后台自动跑 dnf 易致 OOM
+  # 只影响软件源缓存的自动更新，手动 dnf 不受影响
+  case "$PKG" in
+    dnf|yum) ;;
+    *) return 0 ;;
+  esac
+  command -v systemctl >/dev/null 2>&1 || return 0
+  systemctl list-unit-files 2>/dev/null | grep -q "^dnf-makecache\.timer" || return 0
+  local mem_kb
+  mem_kb=$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null || echo 0)
+  if [ "$mem_kb" -gt 0 ] && [ "$mem_kb" -lt 2097152 ]; then
+    if systemctl is-enabled --quiet dnf-makecache.timer 2>/dev/null; then
+      systemctl disable --now dnf-makecache.timer >/dev/null 2>&1 || true
+      echo "[信息] 已禁用 dnf-makecache 定时器（小内存机器，后台自动 dnf 易致 OOM）"
+    fi
+  fi
+}
+
 install_deps() {
-  echo "[信息] 安装依赖（curl/jq/openssl/tar/iproute2）…"
+  # 先检查缺什么：齐了就直接跳过，dnf 在小内存机器上又慢又吃内存
+  local need="" pkgs="" c
+  command -v curl >/dev/null 2>&1 || need="$need curl"
+  command -v jq >/dev/null 2>&1 || need="$need jq"
+  command -v openssl >/dev/null 2>&1 || need="$need openssl"
+  command -v tar >/dev/null 2>&1 || need="$need tar"
+  { command -v ss >/dev/null 2>&1 || command -v ip >/dev/null 2>&1; } || need="$need iproute"
+  command -v crontab >/dev/null 2>&1 || need="$need cron"
+  if [[ -z "${need// }" ]]; then
+    echo "[信息] 依赖已齐全，跳过安装"
+    return 0
+  fi
+  echo "[信息] 安装缺失依赖：$need …"
   case "$PKG" in
     apt) apt-get update -y >/dev/null 2>&1 || true
-         DEBIAN_FRONTEND=noninteractive apt-get install -y curl jq openssl tar iproute2 ca-certificates cron >/dev/null 2>&1 || true ;;
-    dnf) dnf install -y curl jq openssl tar iproute cronie >/dev/null 2>&1 || true ;;
-    yum) yum install -y curl jq openssl tar iproute cronie >/dev/null 2>&1 || true ;;
-    apk) apk add --no-cache curl jq openssl tar iproute2 ca-certificates dcron >/dev/null 2>&1 || true ;;
+         pkgs=""
+         for c in $need; do
+           case "$c" in
+             curl) pkgs="$pkgs curl" ;;
+             jq) pkgs="$pkgs jq" ;;
+             openssl) pkgs="$pkgs openssl" ;;
+             tar) pkgs="$pkgs tar" ;;
+             iproute) pkgs="$pkgs iproute2" ;;
+             cron) pkgs="$pkgs cron" ;;
+           esac
+         done
+         pkgs="$pkgs ca-certificates"
+         # shellcheck disable=SC2086
+         DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs >/dev/null 2>&1 || true ;;
+    dnf) pkgs=""
+         for c in $need; do
+           case "$c" in
+             iproute) pkgs="$pkgs iproute" ;;
+             cron) pkgs="$pkgs cronie" ;;
+             *) pkgs="$pkgs $c" ;;
+           esac
+         done
+         # shellcheck disable=SC2086
+         dnf install -y --setopt=install_weak_deps=False $pkgs >/dev/null 2>&1 || true ;;
+    yum) pkgs=""
+         for c in $need; do
+           case "$c" in
+             iproute) pkgs="$pkgs iproute" ;;
+             cron) pkgs="$pkgs cronie" ;;
+             *) pkgs="$pkgs $c" ;;
+           esac
+         done
+         # shellcheck disable=SC2086
+         yum install -y $pkgs >/dev/null 2>&1 || true ;;
+    apk) pkgs=""
+         for c in $need; do
+           case "$c" in
+             iproute) pkgs="$pkgs iproute2" ;;
+             cron) pkgs="$pkgs dcron" ;;
+             *) pkgs="$pkgs $c" ;;
+           esac
+         done
+         pkgs="$pkgs ca-certificates"
+         # shellcheck disable=SC2086
+         apk add --no-cache $pkgs >/dev/null 2>&1 || true ;;
   esac
   command -v curl >/dev/null 2>&1 || { echo "[错误] curl 安装失败"; exit 1; }
   command -v jq >/dev/null 2>&1 || { echo "[错误] jq 安装失败"; exit 1; }
@@ -88,18 +174,26 @@ port_in_use() {
   return 1
 }
 
-alloc_port() {
-  local p="$1" guard=0
-  while port_in_use "$p"; do
-    p=$((p + 1)); guard=$((guard + 1))
-    if [[ $guard -gt 2000 ]]; then echo "[错误] 找不到可用端口" >&2; exit 1; fi
+rand_port() {
+  # 在 10000-60000 内随机取一个空闲端口
+  local p tries=0
+  while (( tries < 100 )); do
+    p=$(( (RANDOM * 32768 + RANDOM) % 50001 + 10000 ))
+    if ! port_in_use "$p"; then
+      echo "$p"
+      return 0
+    fi
+    tries=$((tries + 1))
   done
-  echo "$p"
+  echo "[错误] 无法分配随机空闲端口" >&2
+  exit 1
 }
 
 #----------------------------- 3. 防火墙放行 ---------------------------------
 open_firewall() {
   echo "[信息] 放行防火墙…"
+  # 用配置里的实际端口（TCP+UDP 双开）
+  local ports="$PORT_VLESS"
   systemctl stop firewalld >/dev/null 2>&1 || true
   systemctl disable firewalld >/dev/null 2>&1 || true
   ufw disable >/dev/null 2>&1 || true
@@ -109,11 +203,35 @@ open_firewall() {
     iptables -P OUTPUT ACCEPT >/dev/null 2>&1 || true
     iptables -F >/dev/null 2>&1 || true
     iptables -X >/dev/null 2>&1 || true
+    for p in $ports; do
+      iptables -C INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null \
+        || iptables -I INPUT 1 -p tcp --dport "$p" -j ACCEPT 2>/dev/null || true
+      iptables -C INPUT -p udp --dport "$p" -j ACCEPT 2>/dev/null \
+        || iptables -I INPUT 1 -p udp --dport "$p" -j ACCEPT 2>/dev/null || true
+    done
     command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save >/dev/null 2>&1 || true
     service iptables save >/dev/null 2>&1 || true
   fi
-  command -v setenforce >/dev/null 2>&1 && setenforce 0 >/dev/null 2>&1 || true
+  # ip6tables：纯 IPv6 机器上 iptables 管不到 v6，需单独放行
+  if command -v ip6tables >/dev/null 2>&1; then
+    for p in $ports; do
+      ip6tables -C INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null \
+        || ip6tables -I INPUT 1 -p tcp --dport "$p" -j ACCEPT 2>/dev/null || true
+      ip6tables -C INPUT -p udp --dport "$p" -j ACCEPT 2>/dev/null \
+        || ip6tables -I INPUT 1 -p udp --dport "$p" -j ACCEPT 2>/dev/null || true
+    done
+    service ip6tables save >/dev/null 2>&1 || true
+  fi
   echo "[信息] 防火墙已放行"
+}
+
+fix_selinux() {
+  if command -v getenforce >/dev/null 2>&1 && [[ "$(getenforce 2>/dev/null)" == "Enforcing" ]]; then
+    echo "[信息] 检测到 SELinux 为 Enforcing，切换为 Permissive（否则代理出站会被拦截）…"
+    setenforce 0 2>/dev/null || true
+    [[ -f /etc/selinux/config ]] && sed -i 's/^SELINUX=enforcing/SELINUX=permissive/' /etc/selinux/config
+    echo "[信息] SELinux 已切换为 Permissive（重启后依然有效）"
+  fi
 }
 
 #----------------------------- 4. 安装 sing-box ------------------------------
@@ -164,7 +282,7 @@ load_or_gen_identity() {
   if [[ -f "$ENV_FILE" ]]; then
     # shellcheck disable=SC1090
     . "$ENV_FILE"
-    [[ -z "${PORT_VLESS:-}" ]] && PORT_VLESS=$(alloc_port "$DEF_PORT_VLESS")
+    [[ -z "${PORT_VLESS:-}" ]] && PORT_VLESS=$(rand_port)
     if [[ -n "${UUID:-}" && -n "${PRIVKEY:-}" && -n "${PUBKEY:-}" && -n "${SHORTID:-}" ]]; then
       echo "[信息] 检测到已有配置，UUID/密钥/端口保持不变（幂等重跑）"
       save_env
@@ -204,7 +322,7 @@ load_or_gen_identity() {
   if [[ -z "$PRIVKEY" || -z "$PUBKEY" || -z "$SHORTID" ]]; then
     echo "[错误] Reality 密钥生成失败"; exit 1
   fi
-  PORT_VLESS=$(alloc_port "$DEF_PORT_VLESS")
+  PORT_VLESS=$(rand_port)
   PORT_VMESS=""; PORT_HY2=""; PORT_TUIC=""; PORT_ANYTLS=""
   echo "[信息] 端口分配：VLESS=$PORT_VLESS"
   save_env
@@ -336,11 +454,14 @@ case "$ACTION" in
   install)
     detect_os
     detect_arch
+    check_memory
+    disable_dnf_makecache
     install_deps
-    open_firewall
     install_singbox
     load_or_gen_identity
     write_config
+    open_firewall
+    fix_selinux
     setup_service
     print_links
     echo
