@@ -26,18 +26,21 @@ curl -fsSL https://raw.githubusercontent.com/tobaye/sing-box-auto/main/sing-box-
 要求：Linux 服务器（Debian / Ubuntu / CentOS / Oracle Linux 等），**root 权限**，
 x86_64 / arm64 / armv7 架构。
 
-## 默认端口
+## 端口（随机分配）
 
-| 协议 | 默认端口 | 说明 |
+新装时 5 个协议的端口在 **10000–60000** 范围内随机分配，互不冲突，自动避开已占用的端口。
+多台服务器各跑一次，端口各不相同。重复运行脚本不会改变已有端口（幂等）。
+
+| 协议 | 传输 | 说明 |
 |---|---|---|
-| VLESS + Reality | 29821 / TCP | |
-| VMess + WS | 20867 / TCP | |
+| VLESS + Reality | TCP | 随机端口 |
+| VMess + WS | TCP | 随机端口 |
 | VMess + Argo | 经 Cloudflare 隧道，无需本机端口 | 临时域名，重启后会变 |
-| Hysteria2 | 37724 / UDP | |
-| TUIC v5 | 60571 / UDP | |
-| AnyTLS | 24878 / TCP | 需要较新 sing-box 内核（脚本自动装最新版） |
+| Hysteria2 | UDP | 随机端口 |
+| TUIC v5 | UDP | 随机端口 |
+| AnyTLS | TCP | 随机端口，需要较新 sing-box 内核（脚本自动装最新版） |
 
-端口被占用时自动递增寻找空闲端口。重复运行脚本不会改变已有端口。
+想固定端口：装完后用管理菜单 5（更换端口）手动指定。
 
 ## 安装后
 
@@ -56,7 +59,7 @@ x86_64 / arm64 / armv7 架构。
 | 是否关闭防火墙（默认是） | 直接执行：停 firewalld / ufw，iptables 全放行 |
 | 内核版本选择（默认最新正式版） | 直接装最新正式版（支持 AnyTLS） |
 | 证书选择（默认自签） | 自动生成 `www.bing.com` 自签证书，不申请 Acme |
-| 端口设置（默认随机） | 用上表默认端口，被占用自动递增 |
+| 端口设置（默认随机） | 新装时 10000–60000 随机分配，互不冲突 |
 | UUID / Reality 密钥 | `sing-box generate` 自动生成 |
 | 双栈 VPS 选 IPv4/IPv6 输出（默认 IPv4） | 优先 IPv4 |
 | Argo 隧道 | 自动尝试 cloudflared **临时隧道**（无需授权）；失败则跳过，不阻塞安装 |
