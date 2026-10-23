@@ -511,9 +511,14 @@ start_argo() {
   nohup "$cf" tunnel --url "http://localhost:${PORT_VMESS}" \
     --edge-ip-version auto --no-autoupdate --protocol http2 \
     > "$SB_DIR/argo.log" 2>&1 &
-  echo "[信息] 等待 Cloudflare 分配临时域名（约 15 秒）…"
-  sleep 15
-  ARGO_DOMAIN="$(grep -a -o 'https://[^ "]*trycloudflare.com' "$SB_DIR/argo.log" 2>/dev/null | head -n 2 | tail -n 1 | sed 's|https://||' || true)"
+  echo "[信息] 等待 Cloudflare 分配临时域名（最多约 60 秒）…"
+  ARGO_DOMAIN=""
+  local _i
+  for _i in $(seq 1 20); do
+    sleep 3
+    ARGO_DOMAIN="$(grep -a -o 'https://[^ "]*trycloudflare.com' "$SB_DIR/argo.log" 2>/dev/null | head -n 2 | tail -n 1 | sed 's|https://||' || true)"
+    [[ -n "$ARGO_DOMAIN" ]] && break
+  done
   if [[ -n "${ARGO_DOMAIN:-}" ]]; then
     echo "[信息] Argo 临时域名：$ARGO_DOMAIN（重启后会变化）"
     if command -v crontab >/dev/null 2>&1; then
@@ -522,6 +527,8 @@ start_argo() {
     fi
   else
     echo "[警告] 未能获取 Argo 域名，跳过 VMess+Argo（不影响其他 5 种协议）"
+    echo "[提示] 隧道日志最后几行："
+    tail -n 5 "$SB_DIR/argo.log" 2>/dev/null || true
     ARGO_DOMAIN=""
   fi
 }
@@ -708,6 +715,13 @@ start_argo_fixed() {
 # 4. Argo 隧道管理子菜单
 do_argo_menu() {
   load_env_or_exit
+  # 载入 Argo 状态用于显示：固定隧道读 argo.env，临时隧道从日志恢复当前域名
+  if [[ -f "$SB_DIR/argo.env" ]]; then
+    # shellcheck disable=SC1090
+    . "$SB_DIR/argo.env" 2>/dev/null || true
+  elif [[ -z "${ARGO_DOMAIN:-}" ]]; then
+    ARGO_DOMAIN="$(grep -a -o 'https://[^ "]*trycloudflare.com' "$SB_DIR/argo.log" 2>/dev/null | head -n 2 | tail -n 1 | sed 's|https://||' || true)"
+  fi
   while true; do
     echo
     echo "---------- Argo 隧道管理 ----------"
@@ -719,8 +733,9 @@ do_argo_menu() {
     echo "1. 重启临时隧道（获取新域名）"
     echo "2. 设置固定隧道（需 Cloudflare Token）"
     echo "3. 切换回临时隧道"
+    echo "4. 重新抓取隧道域名（隧道在跑但没显示域名时用）"
     echo "0. 返回上级"
-    read -rp "请选择 [0-3]: " c
+    read -rp "请选择 [0-4]: " c
     case "$c" in
       1)
         rm -f "$SB_DIR/argo.env"
@@ -754,6 +769,16 @@ EOF
         unset ARGO_MODE ARGO_TOKEN ARGO_DOMAIN
         start_argo
         print_links
+        ;;
+      4)
+        ARGO_DOMAIN="$(grep -a -o 'https://[^ "]*trycloudflare.com' "$SB_DIR/argo.log" 2>/dev/null | head -n 2 | tail -n 1 | sed 's|https://||' || true)"
+        if [[ -n "$ARGO_DOMAIN" ]]; then
+          echo "[信息] 抓到域名：$ARGO_DOMAIN"
+          print_links
+        else
+          echo "[警告] 日志里还没有域名，隧道可能仍在启动中，稍后再试"
+          tail -n 5 "$SB_DIR/argo.log" 2>/dev/null || true
+        fi
         ;;
       0) break ;;
       *) echo "[错误] 无效选择" ;;
@@ -800,14 +825,46 @@ do_update_script() {
 }
 
 # 主管理菜单
+# 检查端口是否在监听：$1=tcp|udp  $2=端口
+port_listening() {
+  case "$1" in
+    tcp) command -v ss >/dev/null 2>&1 && ss -tln 2>/dev/null | grep -qE "[:.]$2[[:space:]]" ;;
+    udp) command -v ss >/dev/null 2>&1 && ss -uln 2>/dev/null | grep -qE "[:.]$2[[:space:]]" ;;
+    *) return 1 ;;
+  esac
+}
+
+# 菜单顶部显示各协议端口监听状态（仿甬哥脚本）
+show_port_status() {
+  echo "---------- 端口状态 ----------"
+  local item name proto port st
+  for item in \
+    "VLESS+Reality|tcp|$PORT_VLESS" \
+    "VMess+WS|tcp|$PORT_VMESS" \
+    "AnyTLS|tcp|$PORT_ANYTLS" \
+    "Hysteria2|udp|$PORT_HY2" \
+    "TUIC|udp|$PORT_TUIC"; do
+    name="${item%%|*}"; proto="${item#*|}"; proto="${proto%%|*}"; port="${item##*|}"
+    if port_listening "$proto" "$port"; then st="监听中"; else st="未监听"; fi
+    echo "$name ($proto/$port)：$st"
+  done
+  if command -v systemctl >/dev/null 2>&1; then
+    echo "服务状态：$(systemctl is-active sing-box 2>/dev/null || echo '未知')"
+  fi
+  echo "------------------------------"
+}
+
 show_menu() {
   if [[ "$EUID" -ne 0 ]]; then
     echo "[错误] 请以 root 运行，例如：sudo bash $0 menu"
     exit 1
   fi
+  load_env_or_exit
   while true; do
     echo
     echo "================ sing-box 管理菜单 ================"
+    show_port_status
+    echo
     echo "1. 更换 UUID（全协议）"
     echo "2. 更新 Reality 密钥对"
     echo "3. 更新自签证书"
