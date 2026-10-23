@@ -22,8 +22,8 @@
 #
 # 特性：
 #   - 全程无交互：UUID、密码、Reality 密钥对全部自动生成
-#   - 默认端口：VLESS 29821 / VMess-WS 20867 / Hy2 37724 / TUIC 60571 / AnyTLS 24878，
-#     端口被占用时自动递增
+#   - 随机端口：新装时 5 个协议端口在 10000-60000 内随机分配（互不冲突，避开已占用），
+#     多台服务器端口各不相同；重跑/升级保留已有端口，菜单 5 可手动改
 #   - 防火墙：自动从配置提取监听端口并在 firewalld/ufw/iptables 放行，
 #     配置增减协议或换端口时自动跟上
 #   - 证书：自动生成 www.bing.com 自签证书（供 Hy2/TUIC/AnyTLS/VMess-WS 使用）
@@ -48,12 +48,7 @@ SB_DIR="/etc/s-box"
 ENV_FILE="$SB_DIR/auto.env"    # 持久化：UUID/端口/密钥，重跑时复用
 LINKS_FILE="/root/singbox-links.txt"
 
-# 默认端口：被占用时自动递增寻找空闲端口
-DEF_PORT_VLESS=29821
-DEF_PORT_VMESS=20867
-DEF_PORT_HY2=37724
-DEF_PORT_TUIC=60571
-DEF_PORT_ANYTLS=24878
+# 端口分配：新装时随机（10000-60000），重跑/升级保留已有端口（见 load_or_gen_identity）
 
 SNI_REALITY="apple.com"        # Reality 伪装域名（原版默认）
 SNI_SELF="www.bing.com"        # 自签证书 CN
@@ -175,13 +170,20 @@ port_in_use() {
 }
 
 # 从默认端口开始，被占用就 +1，直到找到空闲端口
-alloc_port() {
-  local p="$1" guard=0
-  while port_in_use "$p"; do
-    p=$((p + 1)); guard=$((guard + 1))
-    if [[ $guard -gt 2000 ]]; then echo "[错误] 找不到可用端口" >&2; exit 1; fi
+rand_port() {
+  # 在 10000-60000 内随机取一个空闲端口
+  # 参数 $1：已分配端口列表（空格分隔，如 " 29821 20867 "），避免 5 个协议互相冲突
+  local allocated="$1" p tries=0
+  while (( tries < 100 )); do
+    p=$(( (RANDOM * 32768 + RANDOM) % 50001 + 10000 ))
+    if [[ "$allocated" != *" $p "* ]] && ! port_in_use "$p"; then
+      echo "$p"
+      return 0
+    fi
+    tries=$((tries + 1))
   done
-  echo "$p"
+  echo "[错误] 无法分配随机空闲端口" >&2
+  exit 1
 }
 
 #----------------------------- 3. 防火墙放行 ---------------------------------
@@ -351,12 +353,13 @@ load_or_gen_identity() {
   if [[ -f "$ENV_FILE" ]]; then
     # shellcheck disable=SC1090
     . "$ENV_FILE"
-    # 兼容精简版写下的 env：缺失的协议端口按默认分配
-    [[ -z "${PORT_VLESS:-}" ]] && PORT_VLESS=$(alloc_port "$DEF_PORT_VLESS")
-    [[ -z "${PORT_VMESS:-}" ]] && PORT_VMESS=$(alloc_port "$DEF_PORT_VMESS")
-    [[ -z "${PORT_HY2:-}" ]] && PORT_HY2=$(alloc_port "$DEF_PORT_HY2")
-    [[ -z "${PORT_TUIC:-}" ]] && PORT_TUIC=$(alloc_port "$DEF_PORT_TUIC")
-    [[ -z "${PORT_ANYTLS:-}" ]] && PORT_ANYTLS=$(alloc_port "$DEF_PORT_ANYTLS")
+    # 兼容精简版写下的 env：缺失的协议端口随机分配
+    local used=" ${PORT_VLESS:-} ${PORT_VMESS:-} ${PORT_HY2:-} ${PORT_TUIC:-} ${PORT_ANYTLS:-} "
+    [[ -z "${PORT_VLESS:-}" ]] && PORT_VLESS=$(rand_port "$used") && used+=" $PORT_VLESS "
+    [[ -z "${PORT_VMESS:-}" ]] && PORT_VMESS=$(rand_port "$used") && used+=" $PORT_VMESS "
+    [[ -z "${PORT_HY2:-}" ]] && PORT_HY2=$(rand_port "$used") && used+=" $PORT_HY2 "
+    [[ -z "${PORT_TUIC:-}" ]] && PORT_TUIC=$(rand_port "$used") && used+=" $PORT_TUIC "
+    [[ -z "${PORT_ANYTLS:-}" ]] && PORT_ANYTLS=$(rand_port "$used") && used+=" $PORT_ANYTLS "
     if [[ -n "${UUID:-}" && -n "${PRIVKEY:-}" && -n "${PUBKEY:-}" && -n "${SHORTID:-}" ]]; then
       echo "[信息] 检测到已有配置，UUID/端口/密钥保持不变（幂等重跑）"
       save_env
@@ -374,7 +377,7 @@ load_or_gen_identity() {
       PORT_HY2=$(jq -r '.inbounds[2].listen_port' "$SB_DIR/sb.json" 2>/dev/null || true)
       PORT_TUIC=$(jq -r '.inbounds[3].listen_port' "$SB_DIR/sb.json" 2>/dev/null || true)
       PORT_ANYTLS=$(jq -r '.inbounds[4].listen_port // empty' "$SB_DIR/sb.json" 2>/dev/null || true)
-      [[ -z "$PORT_ANYTLS" || "$PORT_ANYTLS" == "null" ]] && PORT_ANYTLS="$DEF_PORT_ANYTLS"
+      [[ -z "$PORT_ANYTLS" || "$PORT_ANYTLS" == "null" ]] && PORT_ANYTLS=$(rand_port " $PORT_VLESS $PORT_VMESS $PORT_HY2 $PORT_TUIC ")
       PRIVKEY=$(jq -r '.inbounds[0].tls.reality.private_key // empty' "$SB_DIR/sb.json" 2>/dev/null || true)
       SHORTID=$(jq -r '.inbounds[0].tls.reality.short_id[0] // empty' "$SB_DIR/sb.json" 2>/dev/null || true)
       PUBKEY="$(cat "$SB_DIR/public.key" 2>/dev/null || true)"
@@ -401,11 +404,12 @@ load_or_gen_identity() {
   if [[ -z "$PRIVKEY" || -z "$PUBKEY" || -z "$SHORTID" ]]; then
     echo "[错误] Reality 密钥生成失败"; exit 1
   fi
-  PORT_VLESS=$(alloc_port "$DEF_PORT_VLESS")
-  PORT_VMESS=$(alloc_port "$DEF_PORT_VMESS")
-  PORT_HY2=$(alloc_port "$DEF_PORT_HY2")
-  PORT_TUIC=$(alloc_port "$DEF_PORT_TUIC")
-  PORT_ANYTLS=$(alloc_port "$DEF_PORT_ANYTLS")
+  local used=" "
+  PORT_VLESS=$(rand_port "$used"); used+=" $PORT_VLESS "
+  PORT_VMESS=$(rand_port "$used"); used+=" $PORT_VMESS "
+  PORT_HY2=$(rand_port "$used"); used+=" $PORT_HY2 "
+  PORT_TUIC=$(rand_port "$used"); used+=" $PORT_TUIC "
+  PORT_ANYTLS=$(rand_port "$used"); used+=" $PORT_ANYTLS "
   echo "[信息] 端口分配：VLESS=$PORT_VLESS VMess-WS=$PORT_VMESS Hy2=$PORT_HY2 TUIC=$PORT_TUIC AnyTLS=$PORT_ANYTLS"
   save_env
 }
