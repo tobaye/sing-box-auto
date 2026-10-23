@@ -13,6 +13,10 @@
 # 用法：
 #   安装：curl -fsSL https://raw.githubusercontent.com/tobaye/sing-box-auto/main/sing-box-auto.sh | sudo bash
 #   卸载：curl -fsSL https://raw.githubusercontent.com/tobaye/sing-box-auto/main/sing-box-auto.sh | sudo bash -s -- uninstall
+#   管理菜单：curl -fsSL https://raw.githubusercontent.com/tobaye/sing-box-auto/main/sing-box-auto.sh | sudo bash -s -- menu
+#   （或下载后 sudo bash sing-box-auto.sh menu）
+#   快捷命令：menu | change-uuid | change-reality | change-cert | change-argo
+#            | change-ports | show-links | restart | uninstall
 #
 # 特性：
 #   - 全程无交互：UUID、密码、Reality 密钥对全部自动生成
@@ -29,7 +33,7 @@
 set -euo pipefail
 
 #----------------------------- 0. 参数与常量 ---------------------------------
-ACTION="${1:-install}"          # install | uninstall
+ACTION="${1:-install}"          # install | uninstall | menu | change-uuid | change-reality | change-cert | change-argo | change-ports | show-links | restart
 
 SB_DIR="/etc/s-box"
 ENV_FILE="$SB_DIR/auto.env"    # 持久化：UUID/端口/密钥，重跑时复用
@@ -378,6 +382,17 @@ EOF
 # 固定隧道需要手动在 CF 官网创建并填 token，无法自动化，本脚本只做临时隧道。
 # 隧道失败不阻塞：拿不到域名就跳过，只是不输出第 3 条链接。
 start_argo() {
+  # 如果配置了固定隧道，优先使用固定隧道
+  if [[ -f "$SB_DIR/argo.env" ]]; then
+    local _am
+    _am=$(grep '^ARGO_MODE=' "$SB_DIR/argo.env" 2>/dev/null | cut -d'"' -f2)
+    if [[ "$_am" == "fixed" ]]; then
+      # shellcheck disable=SC1090
+      . "$SB_DIR/argo.env"
+      start_argo_fixed
+      return 0
+    fi
+  fi
   echo "[信息] 启动 Argo 临时隧道…"
   local cf="$SB_DIR/cloudflared"
   if [[ ! -x "$cf" ]]; then
@@ -494,6 +509,212 @@ do_uninstall() {
   echo "[信息] 卸载完成"
 }
 
+#----------------------------- 12. 管理菜单 ------------------------------------
+# 加载已保存的配置，不存在则报错退出
+load_env_or_exit() {
+  if [[ ! -f "$ENV_FILE" ]]; then
+    echo "[错误] 未找到配置文件 $ENV_FILE，请先运行安装"
+    exit 1
+  fi
+  # shellcheck disable=SC1090
+  . "$ENV_FILE"
+  if [[ -f "$SB_DIR/argo.env" ]]; then
+    # shellcheck disable=SC1090
+    . "$SB_DIR/argo.env"
+  fi
+  if [[ -z "${ARGO_DOMAIN:-}" && "${ARGO_MODE:-}" != "fixed" ]]; then
+    ARGO_DOMAIN="$(grep -a -o 'https://[^ "]*trycloudflare.com' "$SB_DIR/argo.log" 2>/dev/null | head -n 2 | tail -n 1 | sed 's|https://||' || true)"
+  fi
+}
+
+# 1. 更换 UUID（全协议）
+do_change_uuid() {
+  load_env_or_exit
+  echo "[信息] 正在生成新 UUID…"
+  if "$SB_DIR/sing-box" generate uuid >/dev/null 2>&1; then
+    UUID=$("$SB_DIR/sing-box" generate uuid)
+  else
+    UUID=$(cat /proc/sys/kernel/random/uuid)
+  fi
+  echo "[信息] 新 UUID：$UUID"
+  save_env
+  write_config
+  setup_service
+  start_argo
+  print_links
+  echo
+  echo "[完成] UUID 已更换，全协议链接已更新"
+}
+
+# 2. 更新 Reality 密钥对
+do_change_reality() {
+  load_env_or_exit
+  echo "[信息] 正在生成新 Reality 密钥对…"
+  local kp
+  kp=$("$SB_DIR/sing-box" generate reality-keypair)
+  PRIVKEY=$(echo "$kp" | awk '/PrivateKey/{print $2}' | tr -d '"')
+  PUBKEY=$(echo "$kp" | awk '/PublicKey/{print $2}' | tr -d '"')
+  echo "$PUBKEY" > "$SB_DIR/public.key"
+  SHORTID=$("$SB_DIR/sing-box" generate rand --hex 4)
+  if [[ -z "$PRIVKEY" || -z "$PUBKEY" || -z "$SHORTID" ]]; then
+    echo "[错误] Reality 密钥生成失败"; exit 1
+  fi
+  save_env
+  write_config
+  setup_service
+  print_links
+  echo
+  echo "[完成] Reality 密钥对已更新"
+}
+
+# 3. 更新自签证书
+do_change_cert() {
+  load_env_or_exit
+  echo "[信息] 正在重新生成自签证书…"
+  rm -f "$SB_DIR/cert.pem" "$SB_DIR/private.key"
+  gen_certs
+  write_config
+  setup_service
+  print_links
+  echo
+  echo "[完成] 自签证书已更新（Hy2/TUIC/AnyTLS/VMess-WS 已切换新证书）"
+}
+
+# 启动 Argo 固定隧道
+start_argo_fixed() {
+  local cf="$SB_DIR/cloudflared"
+  if [[ ! -x "$cf" ]]; then
+    echo "[错误] cloudflared 未安装，请先运行一次安装"
+    return 1
+  fi
+  if [[ -z "${ARGO_TOKEN:-}" ]]; then
+    echo "[错误] 未配置 Argo Token"
+    return 1
+  fi
+  pkill -f "cloudflared.*tunnel" >/dev/null 2>&1 || true
+  sleep 1
+  nohup "$cf" tunnel --no-autoupdate run --token "$ARGO_TOKEN" > "$SB_DIR/argo.log" 2>&1 &
+  echo "[信息] 固定隧道启动中…"
+  sleep 5
+  if command -v crontab >/dev/null 2>&1; then
+    (crontab -l 2>/dev/null | grep -v "cloudflared.*tunnel"
+     echo "@reboot sleep 15 && $cf tunnel --no-autoupdate run --token $ARGO_TOKEN > $SB_DIR/argo.log 2>&1 &") | crontab - >/dev/null 2>&1 || true
+  fi
+  echo "[信息] 固定隧道域名：${ARGO_DOMAIN:-（未知）}"
+}
+
+# 4. Argo 隧道管理子菜单
+do_argo_menu() {
+  load_env_or_exit
+  while true; do
+    echo
+    echo "---------- Argo 隧道管理 ----------"
+    if [[ "${ARGO_MODE:-}" == "fixed" ]]; then
+      echo "当前模式：固定隧道（${ARGO_DOMAIN:-未知域名}）"
+    else
+      echo "当前模式：临时隧道（${ARGO_DOMAIN:-未建立}）"
+    fi
+    echo "1. 重启临时隧道（获取新域名）"
+    echo "2. 设置固定隧道（需 Cloudflare Token）"
+    echo "3. 切换回临时隧道"
+    echo "0. 返回上级"
+    read -rp "请选择 [0-3]: " c
+    case "$c" in
+      1)
+        rm -f "$SB_DIR/argo.env"
+        unset ARGO_MODE ARGO_TOKEN ARGO_DOMAIN
+        start_argo
+        print_links
+        ;;
+      2)
+        local token domain
+        read -rp "输入 Argo Tunnel Token: " token
+        read -rp "输入固定隧道域名: " domain
+        if [[ -z "$token" || -z "$domain" ]]; then
+          echo "[错误] Token 和域名不能为空"
+          continue
+        fi
+        cat > "$SB_DIR/argo.env" <<EOF
+ARGO_MODE="fixed"
+ARGO_TOKEN="$token"
+ARGO_DOMAIN="$domain"
+EOF
+        chmod 600 "$SB_DIR/argo.env"
+        # shellcheck disable=SC1090
+        . "$SB_DIR/argo.env"
+        start_argo_fixed
+        print_links
+        echo
+        echo "[完成] 已切换到固定隧道：$domain"
+        ;;
+      3)
+        rm -f "$SB_DIR/argo.env"
+        unset ARGO_MODE ARGO_TOKEN ARGO_DOMAIN
+        start_argo
+        print_links
+        ;;
+      0) break ;;
+      *) echo "[错误] 无效选择" ;;
+    esac
+  done
+}
+
+# 5. 更换端口
+do_change_ports() {
+  load_env_or_exit
+  echo "当前端口：VLESS=$PORT_VLESS VMess-WS=$PORT_VMESS Hy2=$PORT_HY2 TUIC=$PORT_TUIC AnyTLS=$PORT_ANYTLS"
+  echo "输入新端口（直接回车保持不变）："
+  local p
+  read -rp "VLESS [$PORT_VLESS]: " p; [[ -n "$p" ]] && PORT_VLESS="$p"
+  read -rp "VMess-WS [$PORT_VMESS]: " p; [[ -n "$p" ]] && PORT_VMESS="$p"
+  read -rp "Hysteria2 [$PORT_HY2]: " p; [[ -n "$p" ]] && PORT_HY2="$p"
+  read -rp "TUIC [$PORT_TUIC]: " p; [[ -n "$p" ]] && PORT_TUIC="$p"
+  read -rp "AnyTLS [$PORT_ANYTLS]: " p; [[ -n "$p" ]] && PORT_ANYTLS="$p"
+  save_env
+  write_config
+  setup_service
+  start_argo
+  print_links
+  echo
+  echo "[完成] 端口已更新"
+}
+
+# 主管理菜单
+show_menu() {
+  if [[ "$EUID" -ne 0 ]]; then
+    echo "[错误] 请以 root 运行，例如：sudo bash $0 menu"
+    exit 1
+  fi
+  while true; do
+    echo
+    echo "================ sing-box 管理菜单 ================"
+    echo "1. 更换 UUID（全协议）"
+    echo "2. 更新 Reality 密钥对"
+    echo "3. 更新自签证书"
+    echo "4. Argo 隧道管理"
+    echo "5. 更换端口"
+    echo "6. 查看节点链接"
+    echo "7. 重启 sing-box 服务"
+    echo "8. 卸载"
+    echo "0. 退出"
+    echo "==================================================="
+    read -rp "请选择 [0-8]: " choice
+    case "$choice" in
+      1) do_change_uuid ;;
+      2) do_change_reality ;;
+      3) do_change_cert ;;
+      4) do_argo_menu ;;
+      5) do_change_ports ;;
+      6) load_env_or_exit; print_links ;;
+      7) load_env_or_exit; setup_service; echo "[完成] 服务已重启" ;;
+      8) do_uninstall; break ;;
+      0) echo "退出"; break ;;
+      *) echo "[错误] 无效选择" ;;
+    esac
+  done
+}
+
+
 #----------------------------- 主流程 ----------------------------------------
 case "$ACTION" in
   install)
@@ -514,8 +735,32 @@ case "$ACTION" in
   uninstall)
     do_uninstall
     ;;
+  menu)
+    show_menu
+    ;;
+  change-uuid)
+    do_change_uuid
+    ;;
+  change-reality)
+    do_change_reality
+    ;;
+  change-cert)
+    do_change_cert
+    ;;
+  change-argo)
+    do_argo_menu
+    ;;
+  change-ports)
+    do_change_ports
+    ;;
+  show-links)
+    load_env_or_exit; print_links
+    ;;
+  restart)
+    load_env_or_exit; setup_service; echo "[完成] 服务已重启"
+    ;;
   *)
-    echo "用法：$0 [install|uninstall]"
+    echo "用法：$0 [install|uninstall|menu|change-uuid|change-reality|change-cert|change-argo|change-ports|show-links|restart]"
     exit 1
     ;;
 esac
