@@ -232,12 +232,32 @@ install_singbox() {
 
 #----------------------------- 4.1 快捷命令 ----------------------------------
 # 把本脚本安装为 sbox 系统命令：sudo sbox 进菜单，sudo sbox <动作> 直达操作
+# 从 GitHub 拉取最新脚本（带防缓存 + 备用源），成功返回 0
+fetch_latest_script() {
+  local dest="$1"
+  local ts url
+  ts=$(date +%s)
+  local urls=(
+    "https://raw.githubusercontent.com/tobaye/sing-box-auto/main/sing-box-auto.sh?t=${ts}"
+    "https://cdn.jsdelivr.net/gh/tobaye/sing-box-auto@main/sing-box-auto.sh"
+  )
+  for url in "${urls[@]}"; do
+    if curl -fsSL --max-time 60 --retry 2 "$url" -o "$dest" \
+       && grep -q "sing-box 全自动一键安装脚本" "$dest" \
+       && bash -n "$dest"; then
+      return 0
+    fi
+    echo "[警告] 从 ${url%%\?*} 获取失败，尝试备用源…"
+  done
+  return 1
+}
+
 setup_shortcut() {
   echo "[信息] 安装 sbox 快捷命令…"
-  if curl -fsSL --max-time 30 --retry 2 \
-    "https://raw.githubusercontent.com/tobaye/sing-box-auto/main/sing-box-auto.sh" \
-    -o /usr/local/bin/sbox; then
+  if fetch_latest_script /usr/local/bin/sbox; then
     chmod +x /usr/local/bin/sbox
+    # 部分系统 root 的 PATH（sudo secure_path）不含 /usr/local/bin，加个软链接兜底
+    ln -sf /usr/local/bin/sbox /usr/bin/sbox 2>/dev/null || true
     echo "[信息] 快捷命令已安装：直接打 sbox 进管理菜单（自动提权）"
   else
     echo "[警告] sbox 快捷命令安装失败，可手动下载脚本使用"
@@ -587,7 +607,7 @@ do_uninstall() {
     (crontab -l 2>/dev/null | grep -v "sing-box run" | grep -v "cloudflared tunnel --url") | crontab - >/dev/null 2>&1 || true
   fi
   rm -rf "$SB_DIR" "$LINKS_FILE"
-  rm -f /usr/local/bin/sbox
+  rm -f /usr/local/bin/sbox /usr/bin/sbox
   echo "[信息] 卸载完成"
 }
 
@@ -765,23 +785,17 @@ do_change_ports() {
 # 9. 更新脚本到最新版（从 GitHub 拉取）
 do_update_script() {
   echo "[信息] 正在从 GitHub 拉取最新脚本…"
-  local url="https://raw.githubusercontent.com/tobaye/sing-box-auto/main/sing-box-auto.sh?t=$(date +%s)"
   local tmpfile
   tmpfile=$(mktemp)
-  if curl -fsSL --max-time 60 --retry 2 "$url" -o "$tmpfile"; then
-    # 校验：必须包含关键标记且语法通过，防止下载到错误页面
-    if grep -q "sing-box 全自动一键安装脚本" "$tmpfile" && bash -n "$tmpfile"; then
-      cp -f "$tmpfile" /usr/local/bin/sbox
-      chmod +x /usr/local/bin/sbox
-      rm -f "$tmpfile"
-      echo "[完成] 脚本已更新到最新版"
-      return 0
-    fi
-    echo "[错误] 下载的文件校验失败，未更新"
-  else
-    echo "[错误] 下载失败，请检查网络后重试"
+  if fetch_latest_script "$tmpfile"; then
+    cp -f "$tmpfile" /usr/local/bin/sbox
+    chmod +x /usr/local/bin/sbox
+    rm -f "$tmpfile"
+    echo "[完成] 脚本已更新到最新版"
+    return 0
   fi
   rm -f "$tmpfile"
+  echo "[错误] 下载失败，请检查网络后重试"
   return 1
 }
 
