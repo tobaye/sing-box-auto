@@ -16,7 +16,7 @@
 #   管理菜单：curl -fsSL https://raw.githubusercontent.com/tobaye/sing-box-auto/main/sing-box-auto.sh | sudo bash -s -- menu
 #   （或下载后 sudo bash sing-box-auto.sh menu）
 #   动作参数：menu | change-uuid | change-reality | change-cert | change-argo
-#            | change-ports | show-links | restart | uninstall
+#            | change-ports | show-links | restart | uninstall | update-script
 #   快捷命令：安装时会自动装好 sbox 命令（/usr/local/bin/sbox），之后直接打
 #            sbox 就进管理菜单（非 root 会自动 sudo 提权），sbox <动作> 执行对应操作
 #
@@ -41,7 +41,7 @@ set -euo pipefail
 if [[ "$(basename "$0")" == "sbox" && $# -eq 0 ]]; then
   ACTION="menu"
 else
-  ACTION="${1:-install}"        # install | uninstall | menu | change-uuid | change-reality | change-cert | change-argo | change-ports | show-links | restart
+  ACTION="${1:-install}"        # install | uninstall | menu | change-uuid | change-reality | change-cert | change-argo | change-ports | show-links | restart | update-script
 fi
 
 SB_DIR="/etc/s-box"
@@ -738,6 +738,29 @@ do_change_ports() {
   echo "[完成] 端口已更新"
 }
 
+# 9. 更新脚本到最新版（从 GitHub 拉取）
+do_update_script() {
+  echo "[信息] 正在从 GitHub 拉取最新脚本…"
+  local url="https://raw.githubusercontent.com/tobaye/sing-box-auto/main/sing-box-auto.sh?t=$(date +%s)"
+  local tmpfile
+  tmpfile=$(mktemp)
+  if curl -fsSL --max-time 60 --retry 2 "$url" -o "$tmpfile"; then
+    # 校验：必须包含关键标记且语法通过，防止下载到错误页面
+    if grep -q "sing-box 全自动一键安装脚本" "$tmpfile" && bash -n "$tmpfile"; then
+      cp -f "$tmpfile" /usr/local/bin/sbox
+      chmod +x /usr/local/bin/sbox
+      rm -f "$tmpfile"
+      echo "[完成] 脚本已更新到最新版"
+      return 0
+    fi
+    echo "[错误] 下载的文件校验失败，未更新"
+  else
+    echo "[错误] 下载失败，请检查网络后重试"
+  fi
+  rm -f "$tmpfile"
+  return 1
+}
+
 # 主管理菜单
 show_menu() {
   if [[ "$EUID" -ne 0 ]]; then
@@ -755,9 +778,10 @@ show_menu() {
     echo "6. 查看节点链接"
     echo "7. 重启 sing-box 服务"
     echo "8. 卸载"
+    echo "9. 更新脚本到最新版"
     echo "0. 退出"
     echo "==================================================="
-    read -rp "请选择 [0-8]: " choice
+    read -rp "请选择 [0-9]: " choice
     case "$choice" in
       1) do_change_uuid ;;
       2) do_change_reality ;;
@@ -767,6 +791,7 @@ show_menu() {
       6) load_env_or_exit; print_links ;;
       7) load_env_or_exit; setup_service; echo "[完成] 服务已重启" ;;
       8) do_uninstall; break ;;
+      9) if do_update_script; then exec /usr/local/bin/sbox menu; fi ;;
       0) echo "退出"; break ;;
       *) echo "[错误] 无效选择" ;;
     esac
@@ -819,8 +844,11 @@ case "$ACTION" in
   restart)
     load_env_or_exit; setup_service; echo "[完成] 服务已重启"
     ;;
+  update-script)
+    do_update_script
+    ;;
   *)
-    echo "用法：$0 [install|uninstall|menu|change-uuid|change-reality|change-cert|change-argo|change-ports|show-links|restart]"
+    echo "用法：$0 [install|uninstall|menu|change-uuid|change-reality|change-cert|change-argo|change-ports|show-links|restart|update-script]"
     exit 1
     ;;
 esac
