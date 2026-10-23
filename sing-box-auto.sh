@@ -15,8 +15,10 @@
 #   卸载：curl -fsSL https://raw.githubusercontent.com/tobaye/sing-box-auto/main/sing-box-auto.sh | sudo bash -s -- uninstall
 #   管理菜单：curl -fsSL https://raw.githubusercontent.com/tobaye/sing-box-auto/main/sing-box-auto.sh | sudo bash -s -- menu
 #   （或下载后 sudo bash sing-box-auto.sh menu）
-#   快捷命令：menu | change-uuid | change-reality | change-cert | change-argo
+#   动作参数：menu | change-uuid | change-reality | change-cert | change-argo
 #            | change-ports | show-links | restart | uninstall
+#   快捷命令：安装时会自动装好 sbox 命令（/usr/local/bin/sbox），之后直接打
+#            sudo sbox 就进管理菜单，sudo sbox <动作> 执行对应操作
 #
 # 特性：
 #   - 全程无交互：UUID、密码、Reality 密钥对全部自动生成
@@ -33,7 +35,12 @@
 set -euo pipefail
 
 #----------------------------- 0. 参数与常量 ---------------------------------
-ACTION="${1:-install}"          # install | uninstall | menu | change-uuid | change-reality | change-cert | change-argo | change-ports | show-links | restart
+# 通过 sbox 快捷命令调用且无参数时默认进菜单；其他方式无参数默认执行安装
+if [[ "$(basename "$0")" == "sbox" && $# -eq 0 ]]; then
+  ACTION="menu"
+else
+  ACTION="${1:-install}"        # install | uninstall | menu | change-uuid | change-reality | change-cert | change-argo | change-ports | show-links | restart
+fi
 
 SB_DIR="/etc/s-box"
 ENV_FILE="$SB_DIR/auto.env"    # 持久化：UUID/端口/密钥，重跑时复用
@@ -161,6 +168,20 @@ install_singbox() {
   rm -rf "$SB_DIR/sing-box.tar.gz" "$SB_DIR/$name"
   chmod +x "$SB_DIR/sing-box"
   echo "[信息] sing-box 安装成功：$("$SB_DIR/sing-box" version | awk '/version/{print $NF}')"
+}
+
+#----------------------------- 4.1 快捷命令 ----------------------------------
+# 把本脚本安装为 sbox 系统命令：sudo sbox 进菜单，sudo sbox <动作> 直达操作
+setup_shortcut() {
+  echo "[信息] 安装 sbox 快捷命令…"
+  if curl -fsSL --max-time 30 --retry 2 \
+    "https://raw.githubusercontent.com/tobaye/sing-box-auto/main/sing-box-auto.sh" \
+    -o /usr/local/bin/sbox; then
+    chmod +x /usr/local/bin/sbox
+    echo "[信息] 快捷命令已安装：sudo sbox（直接进管理菜单）"
+  else
+    echo "[警告] sbox 快捷命令安装失败，可手动下载脚本使用"
+  fi
 }
 
 #----------------------------- 5. 自签证书 -----------------------------------
@@ -506,6 +527,7 @@ do_uninstall() {
     (crontab -l 2>/dev/null | grep -v "sing-box run" | grep -v "cloudflared tunnel --url") | crontab - >/dev/null 2>&1 || true
   fi
   rm -rf "$SB_DIR" "$LINKS_FILE"
+  rm -f /usr/local/bin/sbox
   echo "[信息] 卸载完成"
 }
 
@@ -723,6 +745,7 @@ case "$ACTION" in
     install_deps
     open_firewall
     install_singbox
+    setup_shortcut
     gen_certs
     load_or_gen_identity
     write_config
