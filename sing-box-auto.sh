@@ -271,10 +271,30 @@ gen_certs() {
     echo "[信息] 自签证书已存在，跳过生成"
     return 0
   fi
-  echo "[信息] 生成自签证书（CN=$SNI_SELF）…"
+  echo "[信息] 生成自签证书（CN=$SNI_SELF，含 SAN）…"
   openssl ecparam -genkey -name prime256v1 -out "$SB_DIR/private.key" 2>/dev/null
-  openssl req -new -x509 -days 36500 -key "$SB_DIR/private.key" \
-    -out "$SB_DIR/cert.pem" -subj "/CN=$SNI_SELF" 2>/dev/null
+  # 必须带 SAN：现代 TLS 会拒绝只有 CN 的证书
+  # （x509: certificate relies on legacy Common Name field）
+  if ! openssl req -new -x509 -days 36500 -key "$SB_DIR/private.key" \
+      -out "$SB_DIR/cert.pem" -subj "/CN=$SNI_SELF" \
+      -addext "subjectAltName=DNS:$SNI_SELF" 2>/dev/null; then
+    # 老版本 OpenSSL 不支持 -addext，回退到配置文件方式
+    local _cnf
+    _cnf=$(mktemp)
+    cat > "$_cnf" <<EOF
+[req]
+distinguished_name = dn
+x509_extensions = ext
+prompt = no
+[dn]
+CN = $SNI_SELF
+[ext]
+subjectAltName = DNS:$SNI_SELF
+EOF
+    openssl req -new -x509 -days 36500 -key "$SB_DIR/private.key" \
+      -out "$SB_DIR/cert.pem" -config "$_cnf" 2>/dev/null
+    rm -f "$_cnf"
+  fi
   [[ -f "$SB_DIR/cert.pem" ]] || { echo "[错误] 证书生成失败"; exit 1; }
   echo "[信息] 自签证书生成成功"
 }
