@@ -19,7 +19,7 @@
 #   - SELinux Enforcing 自动切 Permissive（Oracle Linux）；防火墙含 ip6tables（纯 IPv6）
 #   - 安装后打印 vless:// 链接，并保存到 /root/singbox-links.txt
 #
-# 参考原版：https://github.com/yonggekkk/sing-box-yg/blob/main/sb.sh
+# 参考互联网上知名的相关 sing-box 一键脚本
 ###############################################################################
 set -euo pipefail
 
@@ -32,7 +32,7 @@ LINKS_FILE="/root/singbox-links.txt"
 
 DEF_PORT_VLESS=29821            # 兜底默认端口（仅旧 env 缺端口时用；新装走随机）
 
-SNI_REALITY="apple.com"        # Reality 伪装域名（原版默认）
+SNI_REALITY="apple.com"        # Reality 伪装域名（常见默认值）
 
 if [[ "$EUID" -ne 0 ]]; then
   echo "[错误] 请以 root 运行，例如：sudo bash $0"
