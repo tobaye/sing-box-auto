@@ -453,6 +453,16 @@ EOF
 }
 
 #----------------------------- 8. 系统服务 ------------------------------------
+# SELinux：Enforcing 会拦截 sing-box 的出站连接（avc denied name_connect），切为 permissive
+fix_selinux() {
+  if command -v getenforce >/dev/null 2>&1 && [[ "$(getenforce 2>/dev/null)" == "Enforcing" ]]; then
+    echo "[信息] 检测到 SELinux 为 Enforcing，切换为 Permissive（否则代理出站会被拦截）…"
+    setenforce 0 2>/dev/null || true
+    [[ -f /etc/selinux/config ]] && sed -i 's/^SELINUX=enforcing/SELINUX=permissive/' /etc/selinux/config
+    echo "[信息] SELinux 已切换为 Permissive（重启后依然有效）"
+  fi
+}
+
 setup_service() {
   echo "[信息] 配置并启动 sing-box 服务…"
   if [[ -d /run/systemd/system ]] || pidof systemd >/dev/null 2>&1; then
@@ -936,6 +946,7 @@ case "$ACTION" in
     load_or_gen_identity
     write_config
     open_firewall
+    fix_selinux
     setup_service
     start_argo
     print_links
