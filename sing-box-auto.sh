@@ -27,12 +27,11 @@
 #   - 防火墙：自动从配置提取监听端口并在 firewalld/ufw/iptables 放行，
 #     配置增减协议或换端口时自动跟上
 #   - 证书：自动生成 www.bing.com 自签证书（供 Hy2/TUIC/AnyTLS/VMess-WS 使用）
-#   - 幂等：重复运行保留已有 UUID/端口/密钥，只重写配置并重启；也能识别原版
-#     yonggekkk 脚本留下的配置并导入
+#   - 幂等：重复运行保留已有 UUID/端口/密钥，只重写配置并重启；
+#     也能识别互联网上知名同类脚本留下的配置并导入
 #   - 安装后打印全部客户端链接，并保存到 /root/singbox-links.txt
 #
-# 参考原版：https://github.com/yonggekkk/sing-box-yg/blob/main/sb.sh
-# 原版交互点已全部自动化，详见本仓库 README.md
+# 参考互联网上知名的相关 sing-box 一键脚本，交互点已全部自动化，详见本仓库 README.md
 ###############################################################################
 set -euo pipefail
 
@@ -50,7 +49,7 @@ LINKS_FILE="/root/singbox-links.txt"
 
 # 端口分配：新装时随机（10000-60000），重跑/升级保留已有端口（见 load_or_gen_identity）
 
-SNI_REALITY="apple.com"        # Reality 伪装域名（原版默认）
+SNI_REALITY="apple.com"        # Reality 伪装域名（常见默认值）
 SNI_SELF="www.bing.com"        # 自签证书 CN
 
 if [[ "$EUID" -ne 0 ]]; then
@@ -255,7 +254,7 @@ install_singbox() {
   fi
   echo "[信息] 获取 sing-box 最新版本…"
   local ver=""
-  # 对应原版 inssb 选"1"（最新正式版）：优先 GitHub API，失败回退到 releases 页面解析
+  # 对应同类脚本中选"最新正式版"：优先 GitHub API，失败回退到 releases 页面解析
   ver=$(curl -fsSL --max-time 15 --retry 2 https://api.github.com/repos/SagerNet/sing-box/releases/latest 2>/dev/null | jq -r '.tag_name // empty' 2>/dev/null | sed 's/^v//' || true)
   if [[ -z "$ver" ]]; then
     ver=$(curl -fsSL --max-time 15 --retry 2 https://github.com/SagerNet/sing-box/releases/latest 2>/dev/null | grep -oP 'tag/v\K[0-9.]+' | head -n 1 || true)
@@ -308,7 +307,7 @@ setup_shortcut() {
 }
 
 #----------------------------- 5. 自签证书 -----------------------------------
-# 对应原版 inscertificate：默认选"1"（不申请 Acme，直接用自签证书）
+# 对应同类脚本的证书选项：默认不申请 Acme，直接用自签证书
 gen_certs() {
   if [[ -f "$SB_DIR/cert.pem" && -f "$SB_DIR/private.key" ]]; then
     echo "[信息] 自签证书已存在，跳过生成"
@@ -358,7 +357,7 @@ EOF
   chmod 600 "$ENV_FILE"
 }
 
-# 三级取值：①本脚本上次运行的 env → ②原版脚本残留配置 → ③全新生成
+# 三级取值：①本脚本上次运行的 env → ②同类脚本残留配置 → ③全新生成
 load_or_gen_identity() {
   if [[ -f "$ENV_FILE" ]]; then
     # shellcheck disable=SC1090
@@ -392,14 +391,14 @@ load_or_gen_identity() {
       SHORTID=$(jq -r '.inbounds[0].tls.reality.short_id[0] // empty' "$SB_DIR/sb.json" 2>/dev/null || true)
       PUBKEY="$(cat "$SB_DIR/public.key" 2>/dev/null || true)"
       if [[ -n "$PRIVKEY" && -n "$PUBKEY" && -n "$SHORTID" ]]; then
-        echo "[信息] 从原版脚本残留配置导入 UUID/端口/密钥，客户端链接保持不变"
+        echo "[信息] 从同类脚本残留配置导入 UUID/端口/密钥，客户端链接保持不变"
         save_env
         return 0
       fi
     fi
   fi
   echo "[信息] 生成 UUID 与 Reality 密钥对…"
-  # 对应原版：uuid=$(sing-box generate uuid)；用系统 uuid 亦可，这里优先用 sing-box
+  # uuid 生成：优先用 sing-box generate uuid，失败则用系统 uuid
   if "$SB_DIR/sing-box" generate uuid >/dev/null 2>&1; then
     UUID=$("$SB_DIR/sing-box" generate uuid)
   else
@@ -554,7 +553,7 @@ EOF
 }
 
 #----------------------------- 9. Argo 临时隧道 -------------------------------
-# 原版 cfargo→菜单1：cloudflared 临时隧道无需 Cloudflare 账号授权；
+# cloudflared 临时隧道无需 Cloudflare 账号授权；
 # 固定隧道需要手动在 CF 官网创建并填 token，无法自动化，本脚本只做临时隧道。
 # 隧道失败不阻塞：拿不到域名就跳过，只是不输出第 3 条链接。
 start_argo() {
@@ -627,7 +626,7 @@ print_links() {
   local ip host shasum_v
   ip="$(get_ip)"
   host="$(hostname)"
-  # 自签证书 SHA256 pin（对应原版 reshy2 的 pinSHA256 做法）
+  # 自签证书 SHA256 pin（客户端校验用）
   shasum_v=$(openssl x509 -in "$SB_DIR/cert.pem" -outform DER 2>/dev/null | openssl dgst -sha256 | awk '{print $NF}')
 
   local vl_link vm_link hy2_link tuic_link an_link
@@ -911,7 +910,7 @@ port_listening() {
   esac
 }
 
-# 菜单端口状态（排版仿甬哥 showprotocol）
+# 菜单端口状态
 show_port_status() {
   local _d argo_st="未开启"
   if [[ -f "$SB_DIR/argo.env" ]] && grep -q '^ARGO_MODE="fixed"' "$SB_DIR/argo.env" 2>/dev/null; then
