@@ -232,6 +232,16 @@ open_firewall() {
     command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save >/dev/null 2>&1 || true
     service iptables save >/dev/null 2>&1 || true
   fi
+  # ip6tables：纯 IPv6 机器上 iptables 管不到 v6，需单独放行
+  if command -v ip6tables >/dev/null 2>&1; then
+    for p in $ports; do
+      ip6tables -C INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null \
+        || ip6tables -I INPUT 1 -p tcp --dport "$p" -j ACCEPT 2>/dev/null || true
+      ip6tables -C INPUT -p udp --dport "$p" -j ACCEPT 2>/dev/null \
+        || ip6tables -I INPUT 1 -p udp --dport "$p" -j ACCEPT 2>/dev/null || true
+    done
+    service ip6tables save >/dev/null 2>&1 || true
+  fi
   command -v setenforce >/dev/null 2>&1 && setenforce 0 >/dev/null 2>&1 || true
   echo "[信息] 防火墙已放行"
 }
