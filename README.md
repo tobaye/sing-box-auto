@@ -68,9 +68,9 @@ x86_64 / arm64 / armv7 架构。
 全自动版安装时会自动装好 `sbox` 快捷命令，之后管理不需要再下载脚本：
 
 ```bash
-sudo sbox            # 进入管理菜单
-sudo sbox <动作>     # 直接执行：change-uuid | change-reality | change-cert
-                     #   | change-argo | change-ports | show-links | restart | uninstall
+sbox            # 进入管理菜单（opc 下打会自动 sudo 提权）
+sbox <动作>     # 直接执行：change-uuid | change-reality | change-cert
+                #   | change-argo | change-ports | show-links | restart | uninstall
 ```
 
 管理菜单（`sudo sbox`）：更换 UUID、更新 Reality 密钥对、更新自签证书、
