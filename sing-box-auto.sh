@@ -95,13 +95,37 @@ detect_arch() {
 }
 
 install_deps() {
-  echo "[信息] 安装依赖（curl/jq/openssl/tar/iproute2）…"
+  # 先检查缺什么：齐了就直接跳过，dnf 在小内存机器上又慢又吃内存
+  local need="" pkgs="" c
+  command -v curl >/dev/null 2>&1 || need="$need curl"
+  command -v jq >/dev/null 2>&1 || need="$need jq"
+  command -v openssl >/dev/null 2>&1 || need="$need openssl"
+  command -v tar >/dev/null 2>&1 || need="$need tar"
+  { command -v ss >/dev/null 2>&1 || command -v ip >/dev/null 2>&1; } || need="$need iproute"
+  command -v crontab >/dev/null 2>&1 || need="$need cron"
+  if [[ -z "${need// }" ]]; then
+    echo "[信息] 依赖已齐全，跳过安装"
+    return 0
+  fi
+  # 包名映射（cron 在不同发行版名字不一样）
+  for c in $need; do
+    case "$c" in
+      cron)
+        case "$PKG" in
+          apt) pkgs="$pkgs cron" ;;
+          apk) pkgs="$pkgs dcron" ;;
+          *) pkgs="$pkgs cronie" ;;
+        esac ;;
+      *) pkgs="$pkgs $c" ;;
+    esac
+  done
+  echo "[信息] 安装缺失依赖：${pkgs} …"
   case "$PKG" in
     apt) apt-get update -y >/dev/null 2>&1 || true
-         DEBIAN_FRONTEND=noninteractive apt-get install -y curl jq openssl tar iproute2 ca-certificates cron >/dev/null 2>&1 || true ;;
-    dnf) dnf install -y curl jq openssl tar iproute cronie >/dev/null 2>&1 || true ;;
-    yum) yum install -y curl jq openssl tar iproute cronie >/dev/null 2>&1 || true ;;
-    apk) apk add --no-cache curl jq openssl tar iproute2 ca-certificates dcron >/dev/null 2>&1 || true ;;
+         DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs >/dev/null 2>&1 || true ;;
+    dnf) dnf install -y --setopt=install_weak_deps=False $pkgs >/dev/null 2>&1 || true ;;
+    yum) yum install -y $pkgs >/dev/null 2>&1 || true ;;
+    apk) apk add --no-cache $pkgs >/dev/null 2>&1 || true ;;
   esac
   command -v curl >/dev/null 2>&1 || { echo "[错误] curl 安装失败"; exit 1; }
   command -v jq >/dev/null 2>&1 || { echo "[错误] jq 安装失败"; exit 1; }
